@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     brew_api::{PacInfo, get_json_api, get_json_api_multi},
+    database::local::SqlTransaction,
     errors::CatError,
 };
 
@@ -88,6 +89,40 @@ pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError>
     }
 
     Ok(out)
+}
+
+pub async fn detect_conflicts<P>(pacs: &Vec<P>, tx: &mut SqlTransaction) -> Result<(), CatError>
+where
+    P: AsRef<PacInfo>,
+{
+    let set = pacs
+        .iter()
+        .map(|p| p.as_ref().name.as_str())
+        .collect::<HashSet<_>>();
+    for pac in pacs {
+        for conflict_pac in pac
+            .as_ref()
+            .conflicts_with
+            .iter()
+            .chain(pac.as_ref().versioned_formulae.iter())
+        {
+            if set.get(conflict_pac.as_str()).is_some() {
+                return Err(CatError::Pac(format!(
+                    "pac `{}` conflicts with `{}`",
+                    pac.as_ref().name,
+                    conflict_pac
+                )));
+            }
+            if tx.is_installed(conflict_pac).await?.is_some() {
+                return Err(CatError::Pac(format!(
+                    "pac `{}` conflicts with installed pac `{}`",
+                    pac.as_ref().name,
+                    conflict_pac
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]

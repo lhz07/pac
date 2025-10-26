@@ -20,7 +20,7 @@ pub fn get_version_and_arch() -> Result<String, &'static str> {
     }
     let version = MacOSVersion::from_repr(major_ver as usize).ok_or("Unsupported macOS version")?;
 
-    println!("macOS version: macOS {} {}", version, ver.majorVersion);
+    // println!("macOS version: macOS {} {}", version, ver.majorVersion);
     Ok(format!(
         "{}_{}",
         ARCH,

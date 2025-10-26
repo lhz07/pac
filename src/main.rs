@@ -1,20 +1,39 @@
+use std::process::ExitCode;
 use std::sync::LazyLock;
 
+use clap::Parser;
+use pac::cli::command::{Cli, Commands};
 use pac::{
-    CACHE_DIR,
-    brew_api::install_pac,
-    macos::version::ARCH_OS,
+    CACHE_DIR, brew_api::install_pac, database::local::init_db, macos::version::ARCH_OS,
+    package::uninstall::uninstall_a_pac,
 };
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     LazyLock::force(&ARCH_OS);
     LazyLock::force(&CACHE_DIR);
-
-    let name = std::env::args()
-        .nth(1)
-        .expect("Please provide a formula name");
-    if let Err(e) = install_pac(&name).await {
-        eprintln!("{}", e);
+    if let Err(e) = init_db().await {
+        eprintln!("Can not initialize database: {e}");
+        return ExitCode::FAILURE;
     }
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Install { name } => {
+            println!("Installing {}\n", name);
+            if let Err(e) = install_pac(&name).await {
+                eprintln!("\nCan not install {name}, error:\n{e}");
+            }
+        }
+        Commands::Uninstall { name } => {
+            println!("Uninstalling {}\n", name);
+            if let Err(e) = uninstall_a_pac(&name).await {
+                eprintln!("\nCan not uninstall {name}, error:\n{e}");
+            }
+        }
+        Commands::List => {}
+        _ => {
+            println!("Command not implemented yet.");
+        }
+    }
+    ExitCode::SUCCESS
 }

@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::{BREW_CELLAR, BREW_CELLAR_ACTUAL};
+use crate::{BREW_CELLAR, BREW_CELLAR_ACTUAL, BREW_PREFIX};
 
 pub fn relocate_install_prefix(
     binary: &mut [u8],
@@ -69,6 +69,15 @@ fn replace_bytes(data: &mut [u8], old: &[u8], new: &[u8]) {
     unsafe {
         std::ptr::copy_nonoverlapping(result.as_ptr(), data.as_mut_ptr(), data.len());
     }
+}
+
+#[must_use = "this returns the replaced string as a new allocation, \
+              without modifying the original"]
+pub fn replace_str(content: &str, name_version: &str, new_prefix: &str) -> String {
+    let prefix_1 = format!("{}/{}", BREW_CELLAR, name_version);
+    let prefix_2 = BREW_PREFIX;
+    let content = content.replace(&prefix_1, new_prefix);
+    content.replace(&prefix_2, new_prefix)
 }
 
 // #[cfg(not(miri))]

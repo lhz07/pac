@@ -1,22 +1,12 @@
 use crate::{
     BREW_CELLAR, BREW_CELLAR_ACTUAL, BREW_PREFIX, PAC_PATH, errors::CatError, macos::version::ARCH,
 };
-use arwen::macho::{MachoContainer, MachoError};
+use arwen::macho::MachoContainer;
 use goblin::mach::{Mach, MachO};
 use std::{io, path::Path};
 
 fn handle_single_binary(mach: MachO) -> Result<Vec<String>, io::Error> {
-    let load_paths = mach
-        .libs
-        .iter()
-        .filter_map(|s| {
-            if *s != "self" {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let load_paths = mach.libs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if !load_paths.is_empty() {
         Ok(load_paths)
     } else {
@@ -71,37 +61,56 @@ pub fn modify_load_path(
     let paths = list_lib_path(&binary)?;
     let prefix_1 = format!("{}/{}", BREW_CELLAR, prefix_with_version);
     let prefix_2 = format!("{}/{}", BREW_CELLAR_ACTUAL, prefix_with_version);
-    for p in paths {
+    let mut path_iter = paths.into_iter();
+    if let Some(p) = path_iter.next()
+        && p != "self"
+    {
         if p.contains(BREW_PREFIX) {
             let path = Path::new(&p);
             let file_name = path.file_name().unwrap();
             let new_p = format!("{}/lib/{}", PAC_PATH, file_name.to_string_lossy());
             // println!("new path: {}", new_p);
             let mut macho = MachoContainer::parse(&binary)?;
-            if let Err(MachoError::DylibNameMissing(_)) = macho.change_install_name(&p, &new_p) {
-                // try replace id
-                macho.change_install_id(&new_p)?;
-            }
+            macho.change_install_id(&new_p)?;
             binary = macho.data;
         }
         if p.contains(&prefix_1) {
             let new_p = p.replacen(&prefix_1, PAC_PATH, 1);
             // println!("new path with version: {}", new_p);
             let mut macho = MachoContainer::parse(&binary)?;
-            if let Err(MachoError::DylibNameMissing(_)) = macho.change_install_name(&p, &new_p) {
-                // try replace id
-                macho.change_install_id(&new_p)?;
-            }
+            macho.change_install_id(&new_p)?;
             binary = macho.data;
         }
         if p.contains(&prefix_2) {
             let new_p = p.replacen(&prefix_2, PAC_PATH, 1);
             // println!("new path with version: {}", new_p);
             let mut macho = MachoContainer::parse(&binary)?;
-            if let Err(MachoError::DylibNameMissing(_)) = macho.change_install_name(&p, &new_p) {
-                // try replace id
-                macho.change_install_id(&new_p)?;
-            }
+            macho.change_install_id(&new_p)?;
+            binary = macho.data;
+        }
+    }
+    for p in path_iter {
+        if p.contains(BREW_PREFIX) {
+            let path = Path::new(&p);
+            let file_name = path.file_name().unwrap();
+            let new_p = format!("{}/lib/{}", PAC_PATH, file_name.to_string_lossy());
+            let mut macho = MachoContainer::parse(&binary)?;
+            macho.change_install_name(&p, &new_p)?;
+
+            binary = macho.data;
+        }
+        if p.contains(&prefix_1) {
+            let new_p = p.replacen(&prefix_1, PAC_PATH, 1);
+            // println!("new path with version: {}", new_p);
+            let mut macho = MachoContainer::parse(&binary)?;
+            macho.change_install_name(&p, &new_p)?;
+            binary = macho.data;
+        }
+        if p.contains(&prefix_2) {
+            let new_p = p.replacen(&prefix_2, PAC_PATH, 1);
+            // println!("new path with version: {}", new_p);
+            let mut macho = MachoContainer::parse(&binary)?;
+            macho.change_install_name(&p, &new_p)?;
             binary = macho.data;
         }
     }

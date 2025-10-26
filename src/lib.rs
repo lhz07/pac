@@ -4,9 +4,13 @@ use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
 pub mod brew_api;
+pub mod cli;
+pub mod database;
 pub mod errors;
 pub mod macos;
 pub mod package;
+pub mod scopeguard;
+pub mod sql;
 
 pub const PAC_PATH: &str = "/opt/pac";
 pub const CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {

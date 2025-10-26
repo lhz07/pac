@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{BufReader, Read, Write},
     iter::zip,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::LazyLock,
 };
@@ -13,13 +13,22 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
-    API_MIRROR, BOTTLES_MIRROR, CACHE_DIR, CLIENT_WITH_RETRY,
+    API_MIRROR, BOTTLES_MIRROR, CACHE_DIR, CLIENT_WITH_RETRY, PAC_PATH,
+    database::local::{PacState, SqlTransaction},
     errors::{CatError, CloudError, RequestError},
-    macos::{file::remove_dir_force, version::ARCH_OS},
-    package::{find_depend::resolve_depend, install::install, preprocess::before_install},
+    macos::{
+        file::{CmpPath, remove_dir_force, remove_dir_recursively_force, remove_file_force},
+        version::ARCH_OS,
+    },
+    package::{
+        find_depend::{detect_conflicts, resolve_depend},
+        install::install,
+        preprocess::before_install,
+    },
+    scopeguard::DropGuard,
 };
 
 static PROGRESS_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
@@ -46,13 +55,13 @@ pub struct PacInfo {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Version {
-    stable: Option<String>,
-    bottle: bool,
+    pub stable: Option<String>,
+    pub bottle: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Bottle {
-    stable: Option<BottleInfo>,
+    pub stable: Option<BottleInfo>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -63,9 +72,9 @@ pub struct BottleInfo {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct File {
-    cellar: String,
-    url: String,
-    sha256: String,
+    pub cellar: String,
+    pub url: String,
+    pub sha256: String,
 }
 
 pub async fn get_json_api(name: &str) -> Result<PacInfo, CloudError> {
@@ -302,14 +311,93 @@ fn verify_hash(path: &PathBuf, expected_hash: &str) -> Result<bool, CatError> {
     Ok(result_array == expected_hash)
 }
 
-pub async fn install_pac(name: &str) -> Result<(), CatError> {
-    let pac = get_json_api(name).await?;
+pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
+    let mut tx = SqlTransaction::new().await?;
+    if let Some((_, state)) = tx.is_installed(req_name).await? {
+        match state {
+            PacState::Installed => {
+                println!("Package {} is already installed", req_name);
+                return Ok(());
+            }
+            PacState::Broken => {
+                return Err(CatError::Pac(format!(
+                    "package {} is broken, please uninstall it first",
+                    req_name
+                )));
+            }
+        }
+    }
+    let pac = get_json_api(req_name).await?;
     println!("resolving dependents...");
     let deps = resolve_depend(pac).await?;
+    let mut to_install = Vec::new();
+    for dep in deps {
+        match tx.is_installed(&dep.name).await? {
+            Some((_, state)) => {
+                if let PacState::Broken = state {
+                    return Err(CatError::Pac(format!(
+                        "package {} is broken (required by {})\n\
+                        Please uninstall it first",
+                        dep.name, req_name
+                    )));
+                }
+            }
+            None => to_install.push(dep),
+        }
+    }
+    println!("detecting conflicts...");
+    detect_conflicts(&to_install, &mut tx).await?;
     println!("downloading pacs...");
-    let paths = download_multi(&deps).await?;
+    let paths = download_multi(&to_install).await?;
+    let mut temp_paths = DropGuard::new(Vec::<PathBuf>::new(), |temp_paths| {
+        // clean temp dir
+        println!("cleaning temp dirs...");
+        for p in temp_paths {
+            let _ = remove_dir_recursively_force(&p).inspect_err(|e| {
+                eprintln!(
+                    "Warning: Can not clean temp path: {}, error: {e}",
+                    p.display()
+                )
+            });
+        }
+        println!("temp dirs are removed!");
+    });
+    let mut restore_guard = DropGuard::new(Vec::<Vec<PathBuf>>::new(), |installed_files| {
+        eprintln!("encounter an error, restoring install dir");
+        // also remove dirs
+        let mut dirs = BTreeSet::new();
+        let pac_path = Path::new(PAC_PATH);
+        for paths in installed_files.iter() {
+            for p in paths.iter() {
+                let mut ancestors = p.ancestors();
+                // skip itself
+                ancestors.next();
+                while let Some(parent) = ancestors.next()
+                    && !dirs.contains(&CmpPath(parent))
+                    && parent != pac_path
+                {
+                    dirs.insert(CmpPath(parent));
+                }
+                if let Err(e) = remove_file_force(&p) {
+                    eprintln!(
+                        "Warning: Can not remove installed file: {}, error: {e}",
+                        p.display()
+                    )
+                }
+            }
+        }
+        for dir in dirs {
+            if let Err(e) = remove_dir_force(&*dir) {
+                eprintln!(
+                    "Warning: Can not remove installed dir: {}, error: {e}",
+                    dir.0.display()
+                )
+            }
+        }
+        println!("recovery finished!");
+    });
     // install pacs
-    for (pac, mut path) in zip(deps, paths) {
+    for (pac, mut path) in zip(to_install, paths) {
         println!("installing {}", pac.full_name);
         println!("loading downloaded files");
         let downloaded_file = fs::File::open(&path)?;
@@ -318,7 +406,8 @@ pub async fn install_pac(name: &str) -> Result<(), CatError> {
         path.set_extension("");
         path.set_extension("");
         let mut temp_dir = std::env::temp_dir().join(path.file_name().unwrap());
-        let _ = remove_dir_force(&temp_dir);
+        let _ = remove_dir_recursively_force(&temp_dir);
+        temp_paths.push(temp_dir.clone());
         println!("extracting...");
         archive.unpack(&temp_dir)?;
         let name_version = if pac.revision > 0 {
@@ -335,38 +424,64 @@ pub async fn install_pac(name: &str) -> Result<(), CatError> {
         println!("preprocessing...");
         before_install(&temp_dir, &name_version)?;
         println!("preprocess done, installing...");
-        install(&temp_dir)?;
+        let installed_files = Vec::new();
+        restore_guard.push(installed_files);
+        let installed_files = restore_guard.last_mut().unwrap();
+        // we should ensure the path is not conflicted before calling install.
+        // implmentation is in the function below
+        install(&temp_dir, installed_files, &mut tx).await?;
+        tx.install_a_pac(
+            &pac,
+            pac.versions.stable.as_ref().unwrap(),
+            &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
+            &pac.bottle
+                .as_ref()
+                .unwrap()
+                .stable
+                .as_ref()
+                .unwrap()
+                .files
+                .get(ARCH_OS.as_str())
+                .unwrap()
+                .sha256,
+            pac.name == req_name,
+            &installed_files,
+        )
+        .await?;
         println!("Package {} is installed now", pac.full_name);
     }
+    tx.commit().await?;
+    // IMPORTANT: cancel the drop guard
+    restore_guard.into_inner();
     Ok(())
 }
 
-pub async fn install_a_pac(name: &str) -> Result<(), CatError> {
-    let pac = get_json_api(name).await?;
-    if let Some(bottle) = pac.bottle
-        && let Some(bottle) = bottle.stable
-        && let Some(file) = bottle.files.get(ARCH_OS.as_str())
-    {
-        println!("Downloading {}", pac.full_name);
-        let path = download(&pac.tap, &file.url, name, &file.sha256).await?;
-        println!("Downloaded and verified: {:?}", path);
-        println!("extracting...");
-        let downloaded_file = fs::File::open(&path)?;
-        let gz = GzDecoder::new(BufReader::new(downloaded_file));
-        let mut archive = tar::Archive::new(gz);
-        let mut temp_dir = std::env::temp_dir().join(format!("{name}--{}", file.sha256));
-        // std::fs::remove_dir_all(&temp_dir)?;
-        archive.unpack(&temp_dir)?;
-        let name_version = format!("{}/{}", pac.name, pac.versions.stable.unwrap());
-        temp_dir.push(&name_version);
-        before_install(&temp_dir, &name_version)?;
-        println!("preprocess done, installing...");
-        install(&temp_dir)?;
-        println!("Package {} is installed now", pac.full_name);
-    }
+// pub async fn install_a_pac(name: &str) -> Result<(), CatError> {
+//     let pac = get_json_api(name).await?;
+//     if let Some(bottle) = pac.bottle
+//         && let Some(bottle) = bottle.stable
+//         && let Some(file) = bottle.files.get(ARCH_OS.as_str())
+//     {
+//         println!("Downloading {}", pac.full_name);
+//         let path = download(&pac.tap, &file.url, name, &file.sha256).await?;
+//         println!("Downloaded and verified: {:?}", path);
+//         println!("extracting...");
+//         let downloaded_file = fs::File::open(&path)?;
+//         let gz = GzDecoder::new(BufReader::new(downloaded_file));
+//         let mut archive = tar::Archive::new(gz);
+//         let mut temp_dir = std::env::temp_dir().join(format!("{name}--{}", file.sha256));
+//         // std::fs::remove_dir_all(&temp_dir)?;
+//         archive.unpack(&temp_dir)?;
+//         let name_version = format!("{}/{}", pac.name, pac.versions.stable.unwrap());
+//         temp_dir.push(&name_version);
+//         before_install(&temp_dir, &name_version)?;
+//         println!("preprocess done, installing...");
+//         install(&temp_dir)?;
+//         println!("Package {} is installed now", pac.full_name);
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 #[tokio::test]
 async fn test_get_json_api() {
@@ -376,12 +491,12 @@ async fn test_get_json_api() {
     assert!(res.is_ok());
 }
 
-#[tokio::test]
-async fn test_download_a_pac() {
-    let res = install_a_pac("wget").await;
-    println!("{:?}", res);
-    assert!(res.is_ok());
-}
+// #[tokio::test]
+// async fn test_download_a_pac() {
+//     let res = install_a_pac("wget").await;
+//     println!("{:?}", res);
+//     assert!(res.is_ok());
+// }
 
 #[tokio::test]
 async fn test_get_all_json() {
@@ -393,5 +508,7 @@ async fn test_get_all_json() {
 async fn test_download_multi() {
     let pac1 = get_json_api("fish").await.unwrap();
     let pac2 = get_json_api("xmake").await.unwrap();
-    // download_multi(vec![pac1, pac2]).await.unwrap();
+    download_multi(&vec![Rc::new(pac1), Rc::new(pac2)])
+        .await
+        .unwrap();
 }

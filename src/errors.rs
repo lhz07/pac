@@ -5,7 +5,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CatError {
-    #[error("Cloud error: {0}")]
+    #[error(transparent)]
     Cloud(#[from] CloudError),
     #[error("Hash verify error: {0}")]
     Hash(String),
@@ -13,6 +13,8 @@ pub enum CatError {
     Macho(#[from] MachoError),
     #[error("Package error: {0}")]
     Pac(String),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
 }
 
 #[derive(Error, Debug)]
