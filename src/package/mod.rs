@@ -4,4 +4,6 @@ pub mod list;
 pub mod load_path;
 pub mod preprocess;
 pub mod relocate;
+pub mod sandbox;
+pub mod script;
 pub mod uninstall;

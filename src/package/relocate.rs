@@ -80,15 +80,6 @@ pub fn replace_str(content: &str, name_version: &str, new_prefix: &str) -> Strin
     content.replace(&prefix_2, new_prefix)
 }
 
-// #[cfg(not(miri))]
-#[test]
-fn test_relocate() {
-    let old_prefix = "/opt/homebrew/Cellar/fish/4.1.2";
-    let new_prefix = "/opt/pac";
-    let mut binary = std::fs::read("./fish/fish/4.1.2/bin/fish").unwrap();
-    relocate_install_prefix(&mut binary, old_prefix, new_prefix).unwrap();
-}
-
 #[test]
 fn test_replace_bytes() {
     let old_prefix = "/opt/homebrew/Cellar/fish/4.1.2";

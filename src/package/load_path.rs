@@ -117,20 +117,3 @@ pub fn modify_load_path(
 
     Ok(binary)
 }
-
-#[test]
-fn test_list_load_path() {
-    use std::fs;
-    let b = fs::read("./pcre2/pcre2/10.46/lib/libpcre2-8.0.dylib").unwrap();
-    let a = list_lib_path(&b);
-    println!("{a:?}");
-    let b = fs::read("/bin/ls").unwrap();
-    let a = list_lib_path(&b).unwrap();
-    println!("{a:?}");
-}
-
-#[test]
-fn test_modify_load_path() {
-    // use crate::BREW_CELLAR;
-    // modify_load_path("./fish2", &format!("{BREW_CELLAR}/fish/4.1.2")).unwrap();
-}

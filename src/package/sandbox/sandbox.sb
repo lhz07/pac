@@ -1,0 +1,28 @@
+(version 1)
+(debug deny) ; log all denied operations to /var/log/system.log
+
+; deny everything by default
+(deny default)
+
+(allow process-fork)
+(allow process-exec)
+
+(allow file-read-metadata)
+(allow file-map-executable)
+
+; allow read access to common system directories
+(allow file-read*
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/usr")
+    (subpath "/private/etc")
+    (subpath "/private/var")
+    (subpath "/dev")
+    (subpath "/System")
+    (literal "/") ; allow read the root path itself
+)
+
+; allow network outbound and syscalls
+(allow network-outbound)
+(allow mach-lookup)
+(allow sysctl-read)

@@ -1,20 +1,3 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    fs,
-    io::{BufReader, Read, Write},
-    iter::zip,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::LazyLock,
-};
-
-use flate2::read::GzDecoder;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header::CONTENT_LENGTH;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-
 use crate::{
     API_MIRROR, BOTTLES_MIRROR, CACHE_DIR, CLIENT_WITH_RETRY, PAC_PATH,
     database::local::{PacState, SqlTransaction},
@@ -30,6 +13,21 @@ use crate::{
     },
     scopeguard::DropGuard,
 };
+use flate2::read::GzDecoder;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use reqwest::header::CONTENT_LENGTH;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    io::{BufReader, Read, Write},
+    iter::zip,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::LazyLock,
+};
+use tokio::io::AsyncWriteExt;
 
 static PROGRESS_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
     ProgressStyle::default_bar()
@@ -145,6 +143,7 @@ struct Token {
 }
 
 async fn get_token(repo: &str, name: &str) -> Result<String, CloudError> {
+    let name = name.replacen("@", "/", 1);
     let url = format!("https://ghcr.io/token?service=ghcr.io&scope=repository:{repo}/{name}:pull");
     let res = CLIENT_WITH_RETRY.get(url).send().await?.text().await?;
     let json: Token = serde_json::from_str(&res)?;
@@ -268,18 +267,27 @@ pub async fn download_multi(pacs: &Vec<Rc<PacInfo>>) -> Result<Vec<PathBuf>, Cat
     for pac in pacs.iter() {
         if let Some(bottle) = &pac.bottle
             && let Some(bottle) = &bottle.stable
-            && let Some(file) = bottle.files.get(ARCH_OS.as_str())
         {
+            let file = if let Some(file) = bottle.files.get(ARCH_OS.as_str()) {
+                file
+            } else if let Some(file) = bottle.files.get("all") {
+                file
+            } else {
+                return Err(CatError::Pac(format!(
+                    "Package {} has no stable bottle for `{}` or `all` channel",
+                    pac.full_name,
+                    ARCH_OS.as_str()
+                )));
+            };
             let bar = ProgressBar::hidden();
             bar.set_style(PROGRESS_STYLE.clone());
             let bar = multi_bar.add(bar);
             let fut = download_with_bar(&pac.tap, &file.url, &pac.name, &file.sha256, &pac, bar);
             futs.push(fut);
         } else {
-            return Err(CatError::Hash(format!(
-                "Package {} has no stable bottle for {}",
+            return Err(CatError::Pac(format!(
+                "Package {} has no stable bottle",
                 pac.full_name,
-                ARCH_OS.as_str()
             )));
         }
     }
@@ -430,20 +438,19 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
         // we should ensure the path is not conflicted before calling install.
         // implmentation is in the function below
         install(&temp_dir, installed_files, &mut tx).await?;
+        let files = &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap().files;
+        let sha256 = if let Some(file) = files.get(ARCH_OS.as_str()) {
+            &file.sha256
+        } else if let Some(file) = files.get("all") {
+            &file.sha256
+        } else {
+            unreachable!("channel is only all or {}", ARCH_OS.as_str())
+        };
         tx.install_a_pac(
             &pac,
             pac.versions.stable.as_ref().unwrap(),
             &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
-            &pac.bottle
-                .as_ref()
-                .unwrap()
-                .stable
-                .as_ref()
-                .unwrap()
-                .files
-                .get(ARCH_OS.as_str())
-                .unwrap()
-                .sha256,
+            sha256,
             pac.name == req_name,
             &installed_files,
         )
@@ -456,59 +463,10 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
     Ok(())
 }
 
-// pub async fn install_a_pac(name: &str) -> Result<(), CatError> {
-//     let pac = get_json_api(name).await?;
-//     if let Some(bottle) = pac.bottle
-//         && let Some(bottle) = bottle.stable
-//         && let Some(file) = bottle.files.get(ARCH_OS.as_str())
-//     {
-//         println!("Downloading {}", pac.full_name);
-//         let path = download(&pac.tap, &file.url, name, &file.sha256).await?;
-//         println!("Downloaded and verified: {:?}", path);
-//         println!("extracting...");
-//         let downloaded_file = fs::File::open(&path)?;
-//         let gz = GzDecoder::new(BufReader::new(downloaded_file));
-//         let mut archive = tar::Archive::new(gz);
-//         let mut temp_dir = std::env::temp_dir().join(format!("{name}--{}", file.sha256));
-//         // std::fs::remove_dir_all(&temp_dir)?;
-//         archive.unpack(&temp_dir)?;
-//         let name_version = format!("{}/{}", pac.name, pac.versions.stable.unwrap());
-//         temp_dir.push(&name_version);
-//         before_install(&temp_dir, &name_version)?;
-//         println!("preprocess done, installing...");
-//         install(&temp_dir)?;
-//         println!("Package {} is installed now", pac.full_name);
-//     }
-
-//     Ok(())
-// }
-
 #[tokio::test]
 async fn test_get_json_api() {
     let res = get_json_api("wgett").await;
     assert!(matches!(res, Err(CloudError::Api(_))));
     let res = get_json_api("wget").await;
     assert!(res.is_ok());
-}
-
-// #[tokio::test]
-// async fn test_download_a_pac() {
-//     let res = install_a_pac("wget").await;
-//     println!("{:?}", res);
-//     assert!(res.is_ok());
-// }
-
-#[tokio::test]
-async fn test_get_all_json() {
-    let list = get_all_json_api().await.unwrap();
-    println!("len: {}", list.len());
-}
-
-#[tokio::test]
-async fn test_download_multi() {
-    let pac1 = get_json_api("fish").await.unwrap();
-    let pac2 = get_json_api("xmake").await.unwrap();
-    download_multi(&vec![Rc::new(pac1), Rc::new(pac2)])
-        .await
-        .unwrap();
 }

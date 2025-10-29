@@ -72,24 +72,54 @@ where
     Ok(())
 }
 
+// FIXME: follow symlink? we should avoid attack of it
+pub fn copy_file_force<P, Q>(from: P, to: Q) -> Result<(), io::Error>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    if let Err(e) = fs::copy(&from, &to) {
+        match e.kind() {
+            io::ErrorKind::PermissionDenied => {
+                // improve permission
+                add_permit(&to, 0o200)?;
+                if let Some(parent) = to.as_ref().parent() {
+                    add_permit(parent, 0o200)?;
+                }
+                fs::copy(&from, &to)?;
+            }
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub fn remove_file_force<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
-    if let Err(e) = fs::remove_file(&path)
-        && e.kind() == io::ErrorKind::PermissionDenied
-    {
-        // improve permission
-        add_permit(&path, 0o200)?;
-        fs::remove_file(&path)?;
+    // The rm utility removes symbolic links, not the files referenced by the links.
+    // So it is safe to use
+    if let Err(e) = fs::remove_file(&path) {
+        match e.kind() {
+            io::ErrorKind::PermissionDenied => {
+                // improve permission
+                add_permit(&path, 0o200)?;
+                fs::remove_file(&path)?;
+            }
+            _ => return Err(e),
+        }
     }
     Ok(())
 }
 
 pub fn remove_dir_force<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
-    if let Err(e) = fs::remove_dir(&path)
-        && e.kind() == io::ErrorKind::PermissionDenied
-    {
-        // improve permission
-        add_permit(&path, 0o200)?;
-        fs::remove_dir(&path)?;
+    if let Err(e) = fs::remove_dir(&path) {
+        match e.kind() {
+            io::ErrorKind::PermissionDenied => {
+                // improve permission
+                add_permit(&path, 0o200)?;
+                fs::remove_dir(&path)?;
+            }
+            _ => return Err(e),
+        }
     }
     Ok(())
 }
@@ -107,9 +137,8 @@ pub fn remove_dir_recursively_force<P: AsRef<Path>>(path: P) -> Result<(), io::E
     Ok(())
 }
 
-// FIXME: the logic of handling error of permission denied is weird,
-// needs to be improved
-pub async fn cp_dir_with_record_and_check<P, Q>(
+// TODO: decrease code duplicate
+pub async fn cp_dir_patch<P, Q>(
     src: P,
     dst: Q,
     installed_paths: &mut Vec<PathBuf>,
@@ -120,11 +149,8 @@ where
     Q: AsRef<Path>,
 {
     let walk = WalkDir::new(&src).into_iter().filter_entry(|e| {
-        // only install specific dirs at the top level
-        if e.depth() == 1
-            && (!DIR_TO_INSTALL.contains(e.file_name().to_string_lossy().as_ref())
-                || !e.file_type().is_dir())
-        {
+        // only install dirs at the top level
+        if e.depth() == 1 && !e.file_type().is_dir() {
             false
         } else {
             true
@@ -170,12 +196,9 @@ where
             let target = fs::read_link(entry.path())?;
             if target.is_absolute() {
                 // It is too silly to use absolute path for symlink,
-                // so just return an error
-                return Err(CatError::Pac(format!(
-                    "absolute path symlink is not supported: {} -> {}",
-                    entry.path().display(),
-                    target.display()
-                )));
+                // anyway, let's copy them directly
+                fs::copy(&target, &dst)?;
+                continue;
             }
             // println!("create link {} -> {}", dst.display(), target.display());
             if let Err(e) = std::os::unix::fs::symlink(&target, &dst) {
@@ -194,16 +217,112 @@ where
             continue;
         }
         // println!("copy {} -> {}", entry.path().display(), dst.display());
-        else if let Err(e) = fs::copy(entry.path(), &dst)
-            && e.kind() == io::ErrorKind::PermissionDenied
-        {
-            // improve permission
-            add_permit(&dst, 0o200)?;
-            fs::copy(entry.path(), &dst)?;
+        else {
+            copy_file_force(entry.path(), &dst)?;
         }
     }
 
     Ok(())
+}
+
+// FIXME: the logic of handling error of permission denied is weird,
+// needs to be improved
+pub async fn cp_dir_with_record_and_check<P, Q>(
+    src: P,
+    dst: Q,
+    installed_paths: &mut Vec<PathBuf>,
+    tx: &mut SqlTransaction,
+) -> Result<Vec<(PathBuf, PathBuf)>, CatError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    let walk = WalkDir::new(&src).into_iter().filter_entry(|e| {
+        // only install specific dirs at the top level
+        if e.depth() == 1
+            && (!DIR_TO_INSTALL.contains(e.file_name().to_string_lossy().as_ref())
+                || !e.file_type().is_dir())
+        {
+            false
+        } else {
+            true
+        }
+    });
+    let mut symlinks = Vec::new();
+    if let Err(e) = fs::create_dir_all(&dst)
+        && e.kind() == io::ErrorKind::PermissionDenied
+    {
+        // improve permission
+        add_permit(dst.as_ref().parent().unwrap(), 0o200)?;
+        fs::create_dir_all(&dst)?;
+    }
+    for entry in walk {
+        let entry = entry.map_err(|e| -> io::Error { e.into() })?;
+        let mut relative_path = entry
+            .path()
+            .strip_prefix(&src)
+            .map_err(|e| io::Error::other(e))?;
+        if relative_path.starts_with(".bottle") {
+            relative_path = relative_path
+                .strip_prefix(".bottle")
+                .map_err(|e| io::Error::other(e))?;
+        }
+        let dst = dst.as_ref().join(relative_path);
+        if tx.is_path_exist(&dst).await? {
+            return Err(CatError::Pac(format!(
+                "file path conflict: {}",
+                dst.display()
+            )));
+        }
+        if !entry.file_type().is_dir() {
+            installed_paths.push(dst.to_path_buf());
+        }
+        if entry.file_type().is_dir() {
+            // println!("create dir: {}", dst.display());
+            if let Err(e) = fs::create_dir_all(&dst)
+                && e.kind() == io::ErrorKind::PermissionDenied
+            {
+                // improve permission
+                add_permit(dst.parent().unwrap(), 0o200)?;
+                fs::create_dir_all(&dst)?;
+            }
+            continue;
+        }
+        // fs::copy always follow the symlink, so we need to create symlink manually
+        // NOTICE: most symlink is relative path
+        else if entry.file_type().is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            if target.is_absolute() {
+                // It is too silly to use absolute path for symlink,
+                // anyway, let's copy them directly
+                fs::copy(&target, &dst)?;
+                continue;
+            }
+            // println!("create link {} -> {}", dst.display(), target.display());
+            if let Err(e) = std::os::unix::fs::symlink(&target, &dst) {
+                match e.kind() {
+                    io::ErrorKind::AlreadyExists => {
+                        remove_file_force(&dst)?;
+                        std::os::unix::fs::symlink(&target, &dst)?;
+                    }
+                    io::ErrorKind::PermissionDenied => {
+                        add_permit(&dst.parent().unwrap(), 0o200)?;
+                        std::os::unix::fs::symlink(&target, &dst)?;
+                    }
+                    _ => return Err(e.into()),
+                }
+            }
+            // convert target to an absolute path
+            symlinks.push((dst, entry.path().parent().unwrap().join(target)));
+            continue;
+        }
+        // println!("copy {} -> {}", entry.path().display(), dst.display());
+        else {
+            copy_file_force(entry.path(), &dst)?;
+        }
+    }
+
+    Ok(symlinks)
 }
 
 pub fn cp_dir_with_record<P, Q>(
@@ -246,6 +365,8 @@ where
             true
         }
     });
+    // FIXME: fix this weird operation, it do not handle error
+    // when the error kind is not PermissionDenied
     if let Err(e) = fs::create_dir_all(&dst)
         && e.kind() == io::ErrorKind::PermissionDenied
     {
@@ -275,24 +396,9 @@ where
             continue;
         }
         // println!("copy {} -> {}", entry.path().display(), dst.display());
-        if let Err(e) = fs::copy(entry.path(), &dst)
-            && e.kind() == io::ErrorKind::PermissionDenied
-        {
-            // improve permission
-            add_permit(&dst, 0o200)?;
-            fs::copy(entry.path(), &dst)?;
-        }
+
+        copy_file_force(entry.path(), &dst)?;
     }
 
     Ok(())
-}
-
-#[test]
-fn test_rm_rf() {
-    remove_dir_recursively_force("/var/folders/wc/w_4_gvg16bddwnmlv4jxcqgw0000gn/T/libpng-0e84944536d6bf2c7cfd393a4576acf5c0ced03992d156685a7f83c7d2a60215.tar").unwrap();
-}
-
-#[test]
-fn test_cp_r() {
-    cp_dir("/var/folders/wc/w_4_gvg16bddwnmlv4jxcqgw0000gn/T/fish-7c180ae437fb7c0a71f9135ae87cbfaec7af7f7a7658294071fb3f30bbf456cf.tar/fish/4.1.2", "/opt/pac/test").unwrap();
 }

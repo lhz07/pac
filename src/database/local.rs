@@ -89,6 +89,13 @@ impl SqlTransaction {
         Ok(name)
     }
 
+    pub async fn get_pac_names(&mut self) -> Result<Vec<String>, CatError> {
+        let names: Vec<String> = sqlx::query_scalar(sql::SELECT_PAC_NAMES)
+            .fetch_all(&mut *self.tx)
+            .await?;
+        Ok(names)
+    }
+
     pub async fn get_installed_files(&mut self, id: i64) -> Result<Vec<PathBuf>, CatError> {
         let file_list: Vec<String> = sqlx::query_scalar(sql::SELECT_INSTALLED_FILE)
             .bind(id)

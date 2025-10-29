@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use clap::Parser;
 use pac::cli::command::{Cli, Commands};
+use pac::package::list::list_pacs;
 use pac::{
     CACHE_DIR, brew_api::install_pac, database::local::init_db, macos::version::ARCH_OS,
     package::uninstall::uninstall_a_pac,
@@ -27,10 +28,14 @@ async fn main() -> ExitCode {
         Commands::Uninstall { name } => {
             println!("Uninstalling {}\n", name);
             if let Err(e) = uninstall_a_pac(&name).await {
-                eprintln!("\nCan not uninstall {name}, error:\n{e}");
+                eprintln!("\nCan not finish, encounter an error:\n{e}");
             }
         }
-        Commands::List => {}
+        Commands::List => {
+            if let Err(e) = list_pacs().await {
+                eprintln!("\nCan not list installed packages, error:\n{e}");
+            }
+        }
         _ => {
             println!("Command not implemented yet.");
         }

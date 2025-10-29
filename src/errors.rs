@@ -13,6 +13,8 @@ pub enum CatError {
     Macho(#[from] MachoError),
     #[error("Package error: {0}")]
     Pac(String),
+    #[error("Task error: {0}")]
+    Task(String),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 }

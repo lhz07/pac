@@ -61,7 +61,7 @@ where
             if !is_executable_or_dylib(&data) {
                 continue;
             }
-            // println!("try to patch binary: {}", relative);
+            println!("try to patch binary: {}", relative);
             let patched_binary = match patch_binary(data, prefix_with_version) {
                 Ok(b) => b,
                 Err(e) => {

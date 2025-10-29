@@ -1,0 +1,15 @@
+[basic]
+name = "v2raya"
+version = "0.1.0"
+self-update = "{latest_version}"
+dependencies = ["xray | v2ray"]
+
+[[file]]
+url = "https://github.com/v2rayA/homebrew-v2raya/releases/download/{latest_version}/v2raya-aarch64-macos.zip"
+checksum = { method = "sha256", value = "{checksum}" }
+[[file.path]]
+original = "./v2raya-aarch64-macos/v2raya"
+target = "./bin/"
+
+[[task]]
+script = "./get.sh"
