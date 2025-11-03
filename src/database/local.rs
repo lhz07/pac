@@ -3,9 +3,10 @@ use crate::{
     brew_api::{BottleInfo, PacInfo},
     errors::CatError,
     macos::version::ARCH,
+    package::script::Pac,
     sql,
 };
-use sqlx::{Decode, Pool, Sqlite, SqlitePool, prelude::Type, sqlite::SqliteConnectOptions};
+use sqlx::{Decode, Encode, Pool, Sqlite, SqlitePool, prelude::Type, sqlite::SqliteConnectOptions};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -35,6 +36,59 @@ impl<'r> Decode<'r, Sqlite> for PacState {
             1 => Ok(PacState::Broken),
             _ => Err("Invalid value for PacState".into()),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PacSource {
+    Brew,
+    Pac,
+    Local,
+    ThirdParty(String),
+}
+
+impl Type<Sqlite> for PacSource {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <String as Type<Sqlite>>::type_info()
+    }
+}
+
+const SOURCE_PREFIX: &str = "third_party:";
+
+impl<'r> Decode<'r, Sqlite> for PacSource {
+    fn decode(
+        value: <Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <String as Decode<Sqlite>>::decode(value)?;
+        match s.as_str() {
+            "brew" => Ok(PacSource::Brew),
+            "pac" => Ok(PacSource::Pac),
+            "local" => Ok(PacSource::Local),
+            s => {
+                if s.starts_with(SOURCE_PREFIX) {
+                    let s = s.split_at(SOURCE_PREFIX.len()).1.to_string();
+                    Ok(PacSource::ThirdParty(s))
+                } else {
+                    Err("Invalid value for PacSource".into())
+                }
+            }
+        }
+    }
+}
+
+impl<'r> Encode<'r, Sqlite> for PacSource {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::Database>::ArgumentBuffer<'r>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        let str = match &self {
+            PacSource::Brew => "brew".to_string(),
+            PacSource::Local => "local".to_string(),
+            PacSource::Pac => "pac".to_string(),
+            PacSource::ThirdParty(s) => format!("{}{}", SOURCE_PREFIX, s),
+        };
+        let value = <String as Encode<Sqlite>>::encode(str, buf)?;
+        Ok(value)
     }
 }
 
@@ -96,6 +150,14 @@ impl SqlTransaction {
         Ok(names)
     }
 
+    pub async fn get_pacs(&mut self, explict: bool) -> Result<Vec<String>, CatError> {
+        let names: Vec<String> = sqlx::query_scalar(sql::SELECT_PACS)
+            .bind(explict as u8)
+            .fetch_all(&mut *self.tx)
+            .await?;
+        Ok(names)
+    }
+
     pub async fn get_installed_files(&mut self, id: i64) -> Result<Vec<PathBuf>, CatError> {
         let file_list: Vec<String> = sqlx::query_scalar(sql::SELECT_INSTALLED_FILE)
             .bind(id)
@@ -132,6 +194,7 @@ impl SqlTransaction {
     pub async fn install_a_pac(
         &mut self,
         pac: &PacInfo,
+        pac_source: PacSource,
         version: &str,
         bottle: &BottleInfo,
         sha256: &str,
@@ -149,6 +212,7 @@ impl SqlTransaction {
             .bind(ARCH)
             .bind("stable")
             .bind(PAC_PATH)
+            .bind(pac_source)
             .bind(explict as u8)
             .bind(time)
             .bind(sha256)
@@ -167,6 +231,62 @@ impl SqlTransaction {
                 .await?;
         }
         for conflict in &pac.conflicts_with {
+            sqlx::query(sql::INSERT_CONFLICT)
+                .bind(pac_id)
+                .bind(conflict)
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        for file_path in installed_files {
+            sqlx::query(sql::INSERT_INSTALLED_FILE)
+                .bind(pac_id)
+                .bind(file_path.to_string_lossy())
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn install_a_pac_pac(
+        &mut self,
+        pac: &Pac,
+        pac_source: PacSource,
+        explict: bool,
+        installed_files: &[PathBuf],
+    ) -> Result<(), CatError> {
+        let time = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix epoch is always earlier than now")
+            .as_secs() as i64;
+        sqlx::query(sql::INSERT_PAC_PAC)
+            .bind(&pac.basic.name)
+            .bind(&pac.basic.version)
+            .bind(ARCH)
+            .bind("stable")
+            .bind(PAC_PATH)
+            .bind(pac_source)
+            .bind(explict as u8)
+            .bind(time)
+            .execute(&mut *self.tx)
+            .await?;
+        let pac_id = sqlx::query_scalar::<_, i64>(sql::SELECT_PAC_ID)
+            .bind(&pac.basic.name)
+            .bind(PAC_PATH)
+            .fetch_one(&mut *self.tx)
+            .await?;
+        for dep in pac
+            .basic
+            .pac_dependencies
+            .iter()
+            .chain(pac.basic.brew_dependencies.iter())
+        {
+            sqlx::query(sql::INSERT_DEP)
+                .bind(pac_id)
+                .bind(dep)
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        for conflict in pac.conflicts.keys() {
             sqlx::query(sql::INSERT_CONFLICT)
                 .bind(pac_id)
                 .bind(conflict)

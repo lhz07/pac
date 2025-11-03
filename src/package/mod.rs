@@ -1,3 +1,4 @@
+pub mod after_install;
 pub mod find_depend;
 pub mod install;
 pub mod list;

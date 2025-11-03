@@ -21,12 +21,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
+    hash::Hasher,
     io::{BufReader, Read, Write},
     iter::zip,
     path::{Path, PathBuf},
     rc::Rc,
     sync::LazyLock,
 };
+use strum::EnumString;
 use tokio::io::AsyncWriteExt;
 
 static PROGRESS_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
@@ -168,7 +170,7 @@ async fn download(repo: &str, url: &str, name: &str, sha256: &str) -> Result<Pat
         file.write_all(&bytes)?;
         progress.inc(bytes.len() as u64);
     }
-    if verify_hash(&path, sha256)? {
+    if verify_hash(&path, sha256, Sha256::new())? {
         Ok(path)
     } else {
         Err(CatError::Hash(format!(
@@ -189,7 +191,7 @@ async fn download_with_bar(
     let download_file_name = format!("{name}-{}.tar.gz", sha256);
     let mut path = CACHE_DIR.clone();
     path.push(download_file_name);
-    if let Ok(true) = verify_hash(&path, sha256) {
+    if let Ok(true) = verify_hash(&path, sha256, Sha256::new()) {
         println!("{} is already downloaded", name);
         return Ok(path);
     }
@@ -251,7 +253,7 @@ async fn download_with_bar(
         file.write_all(&bytes).await?;
         progress.inc(bytes.len() as u64);
     }
-    if verify_hash(&path, sha256)? {
+    if verify_hash(&path, sha256, Sha256::new())? {
         Ok(path)
     } else {
         Err(CatError::Hash(format!(
@@ -298,11 +300,30 @@ pub async fn download_multi(pacs: &Vec<Rc<PacInfo>>) -> Result<Vec<PathBuf>, Cat
     Ok(res)
 }
 
-fn verify_hash(path: &PathBuf, expected_hash: &str) -> Result<bool, CatError> {
+#[derive(Debug, EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum HashMethod {
+    Sha256,
+    Sha512,
+}
+
+impl<'d> Deserialize<'d> for HashMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'d>,
+    {
+        let s: String = Deserialize::deserialize(deserializer)?;
+        s.parse()
+            .map_err(|e| serde::de::Error::custom(format!("invalid hash method: {:?}", e)))
+    }
+}
+
+pub fn verify_hash<H>(path: &PathBuf, expected_hash: &str, mut hasher: H) -> Result<bool, CatError>
+where
+    H: sha2::Digest,
+{
     let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
-
-    let mut hasher = Sha256::new();
 
     let mut buffer = [0u8; 8192];
     loop {
@@ -337,7 +358,9 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
     }
     let pac = get_json_api(req_name).await?;
     println!("resolving dependents...");
-    let deps = resolve_depend(pac).await?;
+    let mut deps = resolve_depend(&pac.name, &pac.dependencies).await?;
+    // push the root pac into the vec
+    deps.push(Rc::new(pac));
     let mut to_install = Vec::new();
     for dep in deps {
         match tx.is_installed(&dep.name).await? {
@@ -448,6 +471,7 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
         };
         tx.install_a_pac(
             &pac,
+            crate::database::local::PacSource::Brew,
             pac.versions.stable.as_ref().unwrap(),
             &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
             sha256,

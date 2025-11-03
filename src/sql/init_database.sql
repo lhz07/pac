@@ -8,11 +8,12 @@ CREATE TABLE installed_packages (
   arch              TEXT    NOT NULL,                      -- x86_64/arm64/any
   channel           TEXT    NOT NULL,                      -- stable/beta/local
   install_root      TEXT    NOT NULL,                      -- root of install path
+  install_source    TEXT    NOT NULL,                      -- brew | local | pac | third-party
   explicit          INTEGER NOT NULL,                      -- 1=explict，0=install as dependency
   pinned            INTEGER NOT NULL DEFAULT 0,            -- 1=fix version, 0=auto update
   install_time      INTEGER NOT NULL,                      -- UNIX timestamp
   update_time       INTEGER NOT NULL,                      -- UNIX timestamp
-  checksum          TEXT    NOT NULL,                      -- sha256 checksum of the package archive
+  checksum          TEXT,                                  -- sha256 checksum of the package archive
   state             INTEGER NOT NULL DEFAULT 0,            -- 0=installed, 1=broken
   size_installed    INTEGER,                               -- size after installation
   summary           TEXT,

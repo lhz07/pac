@@ -1,6 +1,6 @@
-use std::io;
-
 use crate::{BREW_CELLAR, BREW_CELLAR_ACTUAL, BREW_PREFIX};
+use regex::bytes::Regex;
+use std::{io, sync::LazyLock};
 
 pub fn relocate_install_prefix(
     binary: &mut [u8],
@@ -9,6 +9,8 @@ pub fn relocate_install_prefix(
 ) -> Result<(), io::Error> {
     let new_bytes = new_prefix.as_bytes();
     const DEFAULT_BYTES: &[u8] = b"/opt/homebrew";
+    static PREFIX_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("/opt/homebrew/opt/[^/]+/").unwrap());
     let prefix_1 = format!("{}/{}", BREW_CELLAR, name_version);
     let prefix_2 = format!("{}/{}", BREW_CELLAR_ACTUAL, name_version);
     let old_bytes_1 = prefix_1.as_bytes();
@@ -23,6 +25,18 @@ pub fn relocate_install_prefix(
         ));
     }
     let mut parts = binary.split_mut(|&b| b == 0).collect::<Vec<_>>();
+    for s in parts.iter_mut() {
+        let a = s.to_vec();
+        for m in PREFIX_REGEX.find_iter(&a) {
+            // println!("find bytes to replace new");
+            replace_bytes(s, m.as_bytes(), new_bytes);
+            // println!(
+            //     "{:?} -> {:?}",
+            //     String::from_utf8_lossy(m.as_bytes()),
+            //     String::from_utf8_lossy(new_bytes)
+            // );
+        }
+    }
     for s in parts.iter_mut() {
         if s.windows(old_bytes_1.len()).any(|w| w == old_bytes_1) {
             // println!("find bytes to replace new");

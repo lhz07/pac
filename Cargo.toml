@@ -14,8 +14,9 @@ futures = { version = "0.3.31", default-features = false }
 goblin = { version = "0.10.3" }
 hex = { version = "0.4.3",  default-features = false }
 indicatif = { version = "0.18.1",  default-features = false }
-infer = { version = "0.19.0",  default-features = false }
+infer = { version = "0.19.0" }
 objc2-foundation = { version = "0.3.2" , default-features = false, features = ["alloc", "NSProcessInfo"] }
+regex = "1.12.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "charset", "system-proxy", "h2"] }
 reqwest-middleware = { version = "0.4.2", default-features = false }
 reqwest-retry = { version = "0.7.0", default-features = false }
@@ -31,3 +32,4 @@ thiserror = { version = "2.0.17", default-features = false }
 tokio = { version = "1.48.0",  default-features = false, features = ["macros", "rt-multi-thread", "fs"] }
 toml = "0.9.8"
 walkdir = { version = "2.5.0", default-features = false }
+zip = "6.0.0"

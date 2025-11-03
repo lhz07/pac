@@ -5,6 +5,7 @@ use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
 pub mod brew_api;
 pub mod cli;
+pub mod compress;
 pub mod database;
 pub mod errors;
 pub mod macos;

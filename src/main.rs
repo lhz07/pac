@@ -3,7 +3,8 @@ use std::sync::LazyLock;
 
 use clap::Parser;
 use pac::cli::command::{Cli, Commands};
-use pac::package::list::list_pacs;
+use pac::package::list::{list_leaves, list_pacs};
+use pac::package::script::parse::install_pac_from_file;
 use pac::{
     CACHE_DIR, brew_api::install_pac, database::local::init_db, macos::version::ARCH_OS,
     package::uninstall::uninstall_a_pac,
@@ -19,12 +20,21 @@ async fn main() -> ExitCode {
     }
     let cli = Cli::parse();
     match cli.command {
-        Commands::Install { name } => {
-            println!("Installing {}\n", name);
-            if let Err(e) = install_pac(&name).await {
-                eprintln!("\nCan not install {name}, error:\n{e}");
+        Commands::Install(args) => match args.dir {
+            Some(dir) => {
+                println!("Installing from local dir: {}\n", dir);
+                if let Err(e) = install_pac_from_file(&dir).await {
+                    eprintln!("\nCan not install from local dir, error:\n{e}");
+                }
             }
-        }
+            None => {
+                let name = args.names.first().unwrap();
+                println!("Installing {}\n", name);
+                if let Err(e) = install_pac(&name).await {
+                    eprintln!("\nCan not install {name}, error:\n{e}");
+                }
+            }
+        },
         Commands::Uninstall { name } => {
             println!("Uninstalling {}\n", name);
             if let Err(e) = uninstall_a_pac(&name).await {
@@ -33,6 +43,11 @@ async fn main() -> ExitCode {
         }
         Commands::List => {
             if let Err(e) = list_pacs().await {
+                eprintln!("\nCan not list installed packages, error:\n{e}");
+            }
+        }
+        Commands::Leaves => {
+            if let Err(e) = list_leaves().await {
                 eprintln!("\nCan not list installed packages, error:\n{e}");
             }
         }

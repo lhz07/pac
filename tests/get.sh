@@ -6,14 +6,14 @@ if ! curl -sL https://api.github.com/repos/v2rayA/homebrew-v2raya/releases/lates
 fi
 latest_version=$(cat ./v2raya.json | jq -r '.tag_name')
 echo "Fetching checksum..."
-if ! curl -sL https://github.com/v2rayA/homebrew-v2raya/releases/download/$latest_version/v2raya-x86_64-macos.zip.sha256.txt > ./v2raya-macos.sha256; then
+if ! curl -Ls https://github.com/v2rayA/homebrew-v2raya/releases/download/$latest_version/v2raya-aarch64-macos.zip.sha256.txt > ./v2raya-macos-arm64.sha256; then
     echo "GitHub API rate limit exceeded, please try again later."
-    exit 1
+    exit
 else
-    latest_sha_macos_x64="$(cat ./v2raya-macos.sha256 | awk '{print $1}')"
+    latest_sha_macos_arm64="$(cat ./v2raya-macos-arm64.sha256 | awk '{print $1}')"
 fi
 echo "Writing result.toml..."
 cat > result.toml << EOF
 latest_version = "$latest_version"
-checksum = "$latest_sha_macos_x64"
+checksum = "$latest_sha_macos_arm64"
 EOF

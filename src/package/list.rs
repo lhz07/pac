@@ -9,14 +9,19 @@ pub async fn list_pacs() -> Result<(), CatError> {
         println!("No packages installed.");
     } else {
         println!("Installed packages:\n");
-        let size = terminal_size();
-        if let Some((Width(w), _)) = size {
-            print_columns_vertical(&pacs);
-        } else {
-            for pac in pacs {
-                println!("{}", pac);
-            }
-        }
+        print_columns_vertical(&pacs);
+    }
+    Ok(())
+}
+
+pub async fn list_leaves() -> Result<(), CatError> {
+    let mut tx = SqlTransaction::new().await?;
+    let pacs = tx.get_pacs(true).await?;
+    if pacs.is_empty() {
+        println!("No packages installed.");
+    } else {
+        println!("Installed leave packages:\n");
+        print_columns_vertical(&pacs);
     }
     Ok(())
 }

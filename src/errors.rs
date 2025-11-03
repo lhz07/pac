@@ -15,6 +15,8 @@ pub enum CatError {
     Pac(String),
     #[error("Task error: {0}")]
     Task(String),
+    #[error("Unzip error: {0}")]
+    Unzip(#[from] zip::result::ZipError),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 }

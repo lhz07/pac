@@ -1,50 +1,53 @@
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
+use crate::brew_api::HashMethod;
 
 pub mod parse;
 pub mod task;
 
 #[derive(Debug, Deserialize)]
-struct Pac {
-    basic: Basic,
+pub struct Pac {
+    pub basic: Basic,
     #[serde(default)]
-    conflicts: HashMap<String, String>,
+    pub conflicts: HashMap<String, String>,
     #[serde(default)]
-    file: Vec<PacFile>,
+    pub file: Vec<PacFile>,
     #[serde(default)]
     task: Vec<Task>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Basic {
-    name: String,
-    version: String,
+pub struct Basic {
+    pub name: String,
+    pub version: String,
     #[serde(rename = "self-update")]
-    self_update: Option<String>,
+    pub self_update: Option<String>,
     #[serde(default)]
-    description: String,
-    #[serde(default)]
-    dependencies: Vec<String>,
+    pub description: String,
+    #[serde(default, rename = "brew-dependencies")]
+    pub brew_dependencies: Vec<String>,
+    #[serde(default, rename = "pac-dependencies")]
+    pub pac_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PacFile {
-    url: String,
-    path: Vec<PacPath>,
-    checksum: Option<Checksum>,
+pub struct PacFile {
+    pub url: String,
+    pub path: Vec<PacPath>,
+    pub checksum: Option<Checksum>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Checksum {
-    method: String,
-    value: String,
+pub struct Checksum {
+    pub method: HashMethod,
+    pub value: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct PacPath {
-    original: String,
-    target: String,
+pub struct PacPath {
+    pub original: String,
+    pub target: String,
 }
 
 #[derive(Debug, Deserialize)]

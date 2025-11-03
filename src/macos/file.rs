@@ -2,10 +2,154 @@ use crate::{database::local::SqlTransaction, errors::CatError, package::install:
 use std::{
     fs, io,
     ops::Deref,
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+
+pub async fn unix_cp<P, Q>(
+    from: P,
+    to: Q,
+    installed_paths: &mut Vec<PathBuf>,
+    tx: &mut SqlTransaction,
+) -> Result<(), CatError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    let mut dest_path = to.as_ref().to_path_buf();
+    if to.as_ref().as_os_str().as_bytes().last() == Some(&b'/') {
+        let file_name = from
+            .as_ref()
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+        if to.as_ref().exists() && !to.as_ref().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Destination path is not a directory",
+            ))?;
+        } else if !to.as_ref().exists() {
+            fs::create_dir_all(&to)?;
+        }
+        dest_path = to.as_ref().join(file_name);
+    }
+
+    if from.as_ref().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Source path is a directory",
+        ))?;
+    } else {
+        if tx.is_path_exist(&dest_path).await? {
+            return Err(CatError::Pac(format!(
+                "file path conflict: {}",
+                dest_path.display()
+            )));
+        }
+        if !dest_path.is_dir() {
+            installed_paths.push(dest_path.to_path_buf());
+        }
+        if from.as_ref().is_symlink() {
+            let target = fs::read_link(&from)?;
+            if target.is_absolute() {
+                // It is too silly to use absolute path for symlink,
+                // anyway, let's copy them directly
+                fs::copy(&target, &dest_path)?;
+                return Ok(());
+            }
+            std::os::unix::fs::symlink(&target, &dest_path)?;
+            return Ok(());
+        }
+        fs::copy(&from, &dest_path)?;
+    }
+    Ok(())
+}
+
+pub async fn unix_cp_r<P, Q>(
+    from: P,
+    to: Q,
+    installed_paths: &mut Vec<PathBuf>,
+    tx: &mut SqlTransaction,
+) -> Result<(), CatError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    if from.as_ref().is_dir() {
+        let walk = WalkDir::new(&from);
+        let mut symlinks = Vec::new();
+        if let Err(e) = fs::create_dir_all(&to)
+            && e.kind() == io::ErrorKind::PermissionDenied
+        {
+            // improve permission
+            add_permit(to.as_ref().parent().unwrap(), 0o200)?;
+            fs::create_dir_all(&to)?;
+        }
+        for entry in walk {
+            let entry = entry.map_err(|e| -> io::Error { e.into() })?;
+            let relative_path = entry
+                .path()
+                .strip_prefix(&from)
+                .map_err(|e| io::Error::other(e))?;
+            let dst = to.as_ref().join(relative_path);
+            if tx.is_path_exist(&dst).await? {
+                return Err(CatError::Pac(format!(
+                    "file path conflict: {}",
+                    dst.display()
+                )));
+            }
+            if !entry.file_type().is_dir() {
+                installed_paths.push(dst.to_path_buf());
+            }
+            if entry.file_type().is_dir() {
+                // println!("create dir: {}", dst.display());
+                if let Err(e) = fs::create_dir_all(&dst)
+                    && e.kind() == io::ErrorKind::PermissionDenied
+                {
+                    // improve permission
+                    add_permit(dst.parent().unwrap(), 0o200)?;
+                    fs::create_dir_all(&dst)?;
+                }
+                continue;
+            }
+            // fs::copy always follow the symlink, so we need to create symlink manually
+            // NOTICE: most symlink is relative path
+            else if entry.file_type().is_symlink() {
+                let target = fs::read_link(entry.path())?;
+                if target.is_absolute() {
+                    // It is too silly to use absolute path for symlink,
+                    // anyway, let's copy them directly
+                    fs::copy(&target, &dst)?;
+                    continue;
+                }
+                // println!("create link {} -> {}", dst.display(), target.display());
+                if let Err(e) = std::os::unix::fs::symlink(&target, &dst) {
+                    match e.kind() {
+                        io::ErrorKind::AlreadyExists => {
+                            remove_file_force(&dst)?;
+                            std::os::unix::fs::symlink(&target, &dst)?;
+                        }
+                        io::ErrorKind::PermissionDenied => {
+                            add_permit(&dst.parent().unwrap(), 0o200)?;
+                            std::os::unix::fs::symlink(&target, &dst)?;
+                        }
+                        _ => return Err(e.into()),
+                    }
+                }
+                // convert target to an absolute path
+                symlinks.push((dst, entry.path().parent().unwrap().join(target)));
+                continue;
+            }
+            // println!("copy {} -> {}", entry.path().display(), dst.display());
+            else {
+                copy_file_force(entry.path(), &dst)?;
+            }
+        }
+    } else {
+        unix_cp(&from, &to, installed_paths, tx).await?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CmpPath<P: AsRef<Path> + Eq + PartialEq>(pub P);
@@ -72,6 +216,20 @@ where
     Ok(())
 }
 
+pub fn set_permit<P>(file_path: P, permit_code: u32) -> Result<(), io::Error>
+where
+    P: AsRef<std::path::Path>,
+{
+    let mut old_permit = fs::metadata(&file_path)?.permissions();
+    if permit_code == old_permit.mode() {
+        // no need to do anything
+        return Ok(());
+    }
+    old_permit.set_mode(permit_code);
+    fs::set_permissions(&file_path, old_permit)?;
+    Ok(())
+}
+
 // FIXME: follow symlink? we should avoid attack of it
 pub fn copy_file_force<P, Q>(from: P, to: Q) -> Result<(), io::Error>
 where
@@ -104,6 +262,9 @@ pub fn remove_file_force<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
                 add_permit(&path, 0o200)?;
                 fs::remove_file(&path)?;
             }
+            io::ErrorKind::NotFound => {
+                // already removed
+            }
             _ => return Err(e),
         }
     }
@@ -117,6 +278,9 @@ pub fn remove_dir_force<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
                 // improve permission
                 add_permit(&path, 0o200)?;
                 fs::remove_dir(&path)?;
+            }
+            io::ErrorKind::NotFound => {
+                // already removed
             }
             _ => return Err(e),
         }

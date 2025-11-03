@@ -8,14 +8,18 @@ use crate::{
     brew_api::{PacInfo, get_json_api, get_json_api_multi},
     database::local::SqlTransaction,
     errors::CatError,
+    package::script::Pac,
 };
 
-/// In the future we’ll switch to a database, so dependency parsing and database updates
-/// will become two separate operations — updating the database won’t always be required.
-pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError> {
+// In the future we’ll switch to a database, so dependency parsing and database updates
+// will become two separate operations — updating the database won’t always be required.
+/// returned pacs not include the root pac
+pub async fn resolve_depend(
+    root_name: &str,
+    root_deps: &Vec<String>,
+) -> Result<Vec<Rc<PacInfo>>, CatError> {
     let mut cache: HashMap<Rc<String>, Rc<PacInfo>> = HashMap::new();
-    let root_rc = Rc::new(root);
-    cache.insert(Rc::new(root_rc.name.clone()), Rc::clone(&root_rc));
+    let root_name = Rc::new(root_name.to_string());
 
     // Permanently marked nodes: already sorted and stored in the result
     let mut perm: HashSet<Rc<String>> = HashSet::new();
@@ -34,7 +38,7 @@ pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError>
         Exit(Rc<String>),
     }
 
-    let mut stack: Vec<Frame> = vec![Frame::Enter(Rc::new(root_rc.name.clone()))];
+    let mut stack: Vec<Frame> = vec![Frame::Enter(root_name.clone())];
 
     while let Some(frame) = stack.pop() {
         match frame {
@@ -52,11 +56,17 @@ pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError>
                 path_stack.push(name.clone());
 
                 // Ensure node data is available (fetch if not cached)
-                if !cache.contains_key(&name) {
-                    let pac = get_json_api(&name).await?;
-                    cache.insert(name.clone(), Rc::new(pac));
-                }
-                let deps = cache.get(&name).unwrap().dependencies.clone();
+                let deps = if !cache.contains_key(&name) {
+                    if name.as_str() == root_name.as_str() {
+                        root_deps.clone()
+                    } else {
+                        let pac = get_json_api(&name).await?;
+                        cache.insert(name.clone(), Rc::new(pac));
+                        cache.get(&name).unwrap().dependencies.clone()
+                    }
+                } else {
+                    cache.get(&name).unwrap().dependencies.clone()
+                };
                 let deps_uncached = deps
                     .iter()
                     .filter(|s| !cache.contains_key(*s))
@@ -80,8 +90,10 @@ pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError>
                 if let Some(pos) = path_stack.iter().rposition(|n| n == &name) {
                     path_stack.remove(pos);
                 }
-                if perm.insert(name.clone()) {
-                    let rc = Rc::clone(cache.get(&name).expect("cached PacInfo must exist"));
+                if perm.insert(name.clone())
+                    && let Some(pac) = cache.get(&name)
+                {
+                    let rc = Rc::clone(pac);
                     out.push(rc);
                 }
             }
@@ -91,32 +103,56 @@ pub async fn resolve_depend(root: PacInfo) -> Result<Vec<Rc<PacInfo>>, CatError>
     Ok(out)
 }
 
-pub async fn detect_conflicts<P>(pacs: &Vec<P>, tx: &mut SqlTransaction) -> Result<(), CatError>
-where
-    P: AsRef<PacInfo>,
-{
-    let set = pacs
-        .iter()
-        .map(|p| p.as_ref().name.as_str())
-        .collect::<HashSet<_>>();
-    for pac in pacs {
-        for conflict_pac in pac
-            .as_ref()
+pub trait PacInfoRef {
+    fn name(&self) -> &str;
+    fn conflicts_with(&self) -> impl Iterator<Item = &String>;
+}
+
+impl AsRef<PacInfo> for PacInfo {
+    fn as_ref(&self) -> &PacInfo {
+        self
+    }
+}
+
+impl<T: AsRef<PacInfo>> PacInfoRef for T {
+    fn name(&self) -> &str {
+        &self.as_ref().name
+    }
+    fn conflicts_with(&self) -> impl Iterator<Item = &String> {
+        self.as_ref()
             .conflicts_with
             .iter()
-            .chain(pac.as_ref().versioned_formulae.iter())
-        {
+            .chain(self.as_ref().versioned_formulae.iter())
+    }
+}
+
+impl PacInfoRef for &Pac {
+    fn name(&self) -> &str {
+        &self.basic.name
+    }
+    fn conflicts_with(&self) -> impl Iterator<Item = &String> {
+        self.conflicts.keys()
+    }
+}
+
+pub async fn detect_conflicts<P>(pacs: &[P], tx: &mut SqlTransaction) -> Result<(), CatError>
+where
+    P: PacInfoRef,
+{
+    let set = pacs.iter().map(|p| p.name()).collect::<HashSet<_>>();
+    for pac in pacs {
+        for conflict_pac in pac.conflicts_with() {
             if set.get(conflict_pac.as_str()).is_some() {
                 return Err(CatError::Pac(format!(
                     "pac `{}` conflicts with `{}`",
-                    pac.as_ref().name,
+                    pac.name(),
                     conflict_pac
                 )));
             }
             if tx.is_installed(conflict_pac).await?.is_some() {
                 return Err(CatError::Pac(format!(
                     "pac `{}` conflicts with installed pac `{}`",
-                    pac.as_ref().name,
+                    pac.name(),
                     conflict_pac
                 )));
             }
@@ -128,7 +164,7 @@ where
 #[tokio::test]
 async fn test_resolve_depend() {
     let pac = get_json_api("imagemagick").await.unwrap();
-    let res = resolve_depend(pac).await.unwrap();
+    let res = resolve_depend(&pac.name, &pac.dependencies).await.unwrap();
     for i in res {
         println!("{}", i.full_name);
     }
