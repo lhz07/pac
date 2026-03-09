@@ -1,18 +1,31 @@
 use crate::{
     PAC_PATH,
     brew_api::{BottleInfo, PacInfo},
+    database::{SQL_OPTS, SQL_POOL, basic::AsConnection},
     errors::CatError,
     macos::version::ARCH,
     package::script::Pac,
     sql,
 };
-use sqlx::{Decode, Encode, Pool, Sqlite, SqlitePool, prelude::Type, sqlite::SqliteConnectOptions};
+use sqlx::{
+    Decode, Encode, Sqlite, SqlitePool,
+    pool::PoolConnection,
+    prelude::{FromRow, Type},
+};
 use std::{
-    fs,
+    fs, future,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::LazyLock,
     time::UNIX_EPOCH,
 };
+
+#[derive(Debug, FromRow)]
+pub struct PacData {
+    pub id: i64,
+    pub name: String,
+    pub version: String,
+    pub build_epoch: i64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum PacState {
@@ -103,94 +116,48 @@ pub async fn init_db() -> Result<(), CatError> {
     Ok(())
 }
 
-static SQL_OPTS: LazyLock<SqliteConnectOptions> = LazyLock::new(|| {
-    SqliteConnectOptions::new()
-        .filename(format!("{PAC_PATH}/PacData/pacs.sqlite"))
-        .create_if_missing(true)
-});
+pub struct SqlTransMark {
+    _p: (),
+}
 
-static SQL_POOL: LazyLock<Pool<Sqlite>> =
-    LazyLock::new(|| Pool::connect_lazy_with(SQL_OPTS.clone()));
+impl SqlTransMark {
+    pub async fn get_connection(&self) -> Result<PoolConnection<Sqlite>, CatError> {
+        let conn = SQL_POOL.acquire().await?;
+        Ok(conn)
+    }
+    pub async fn into_transaction(self) -> Result<SqlTransaction, CatError> {
+        let tx = SQL_POOL.begin().await?;
+        Ok(SqlTransaction { tx })
+    }
+}
 
+/// a sql transaction
+///
+/// **NOTE:** if you need read-only operation, use `PoolConnection<Sqlite>` instead
+///
+/// It is strongly recommended to use read-only operation when possible
+///
+/// **WARNING:** transaction may cause deadlock, if you modify the db by a transaction, than
+/// the transaction is locked until you commit/drop it, which means you can still read the db
+/// through another transaction, but any write operaion(through another transaction) will get deadlock.
 pub struct SqlTransaction {
-    pub tx: sqlx::Transaction<'static, Sqlite>,
+    tx: sqlx::Transaction<'static, Sqlite>,
 }
 
 impl SqlTransaction {
-    pub async fn new() -> Result<Self, CatError> {
-        let tx = SQL_POOL.begin().await?;
-        Ok(Self { tx })
+    /// # Safety
+    /// You should ensure that there is no write transaction alive
+    pub unsafe fn new_mark() -> SqlTransMark {
+        SqlTransMark { _p: () }
     }
-    pub async fn commit(self) -> Result<(), CatError> {
+    pub fn rollback(self) -> SqlTransMark {
+        drop(self.tx);
+        SqlTransMark { _p: () }
+    }
+    pub async fn commit(self) -> Result<SqlTransMark, CatError> {
         self.tx.commit().await?;
-        Ok(())
+        Ok(SqlTransMark { _p: () })
     }
-
-    pub async fn is_installed(&mut self, name: &str) -> Result<Option<(i64, PacState)>, CatError> {
-        let id_state = sqlx::query_as::<_, (i64, PacState)>(sql::SELECT_PAC_ID)
-            .bind(name)
-            .bind(PAC_PATH)
-            .fetch_optional(&mut *self.tx)
-            .await?;
-        Ok(id_state)
-    }
-
-    pub async fn get_pac_name(&mut self, id: i64) -> Result<String, CatError> {
-        let name: String = sqlx::query_scalar(sql::SELECT_PAC_NAME)
-            .bind(id)
-            .fetch_one(&mut *self.tx)
-            .await?;
-        Ok(name)
-    }
-
-    pub async fn get_pac_names(&mut self) -> Result<Vec<String>, CatError> {
-        let names: Vec<String> = sqlx::query_scalar(sql::SELECT_PAC_NAMES)
-            .fetch_all(&mut *self.tx)
-            .await?;
-        Ok(names)
-    }
-
-    pub async fn get_pacs(&mut self, explict: bool) -> Result<Vec<String>, CatError> {
-        let names: Vec<String> = sqlx::query_scalar(sql::SELECT_PACS)
-            .bind(explict as u8)
-            .fetch_all(&mut *self.tx)
-            .await?;
-        Ok(names)
-    }
-
-    pub async fn get_installed_files(&mut self, id: i64) -> Result<Vec<PathBuf>, CatError> {
-        let file_list: Vec<String> = sqlx::query_scalar(sql::SELECT_INSTALLED_FILE)
-            .bind(id)
-            .fetch_all(&mut *self.tx)
-            .await?;
-        let path_list = file_list.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-        Ok(path_list)
-    }
-
-    pub async fn get_reverse_deps(&mut self, name: &str) -> Result<Vec<String>, CatError> {
-        let rev_deps: Vec<i64> = sqlx::query_scalar(sql::SELECT_REVERSE_DEP)
-            .bind(name)
-            .fetch_all(&mut *self.tx)
-            .await?;
-        let mut deps_name = Vec::new();
-        for id in rev_deps {
-            let name = self.get_pac_name(id).await?;
-            deps_name.push(name);
-        }
-        Ok(deps_name)
-    }
-
-    pub async fn is_path_exist<P>(&mut self, path: P) -> Result<bool, CatError>
-    where
-        P: AsRef<Path>,
-    {
-        let (exists,): (i64,) = sqlx::query_as(sql::SELECT_EXIST_FILE)
-            .bind(path.as_ref().to_string_lossy())
-            .fetch_one(&mut *self.tx)
-            .await?;
-        Ok(exists == 1)
-    }
-
     pub async fn install_a_pac(
         &mut self,
         pac: &PacInfo,
@@ -320,11 +287,38 @@ impl SqlTransaction {
 
         Ok(())
     }
+}
 
-    pub async fn get_orphan_pacs(&mut self) -> Result<Vec<(i64, String, PacState)>, CatError> {
-        let rows = sqlx::query_as::<_, (i64, String, PacState)>(sql::SELECT_ORPHAN_PAC)
-            .fetch_all(&mut *self.tx)
-            .await?;
-        Ok(rows)
+impl Deref for SqlTransaction {
+    type Target = sqlx::Transaction<'static, Sqlite>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
     }
+}
+
+impl DerefMut for SqlTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tx
+    }
+}
+
+impl AsConnection for SqlTransaction {
+    fn to_conn_type(
+        &mut self,
+    ) -> impl Future<Output = Result<super::basic::ConnType<'_>, CatError>> {
+        future::ready(Ok(super::basic::ConnType::Transaction(&mut self.tx)))
+    }
+}
+
+#[tokio::test]
+async fn test_deadlock() {
+    use crate::database::basic::{SqlPool, SqlRead};
+    let mut a = SqlPool;
+    let path_list = a.get_installed_files(1).await.unwrap();
+    println!("{:?}", path_list);
+    let tx = SQL_POOL.begin().await.unwrap();
+    let mut b = SqlTransaction { tx };
+    println!("{:?}", b.delete_a_pac(6).await);
+    b.commit().await.unwrap();
 }

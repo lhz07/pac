@@ -91,7 +91,7 @@ pub fn replace_str(content: &str, name_version: &str, new_prefix: &str) -> Strin
     let prefix_1 = format!("{}/{}", BREW_CELLAR, name_version);
     let prefix_2 = BREW_PREFIX;
     let content = content.replace(&prefix_1, new_prefix);
-    content.replace(&prefix_2, new_prefix)
+    content.replace(prefix_2, new_prefix)
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::{database::local::SqlTransaction, errors::CatError, package::install::DIR_TO_INSTALL};
+use crate::{database::basic::SqlRead, errors::CatError, package::install::DIR_TO_INSTALL};
 use std::{
     fs, io,
     ops::Deref,
@@ -11,7 +11,7 @@ pub async fn unix_cp<P, Q>(
     from: P,
     to: Q,
     installed_paths: &mut Vec<PathBuf>,
-    tx: &mut SqlTransaction,
+    tx: &mut impl SqlRead,
 ) -> Result<(), CatError>
 where
     P: AsRef<Path>,
@@ -65,11 +65,12 @@ where
     Ok(())
 }
 
+/// database read-only, based on current transaction
 pub async fn unix_cp_r<P, Q>(
     from: P,
     to: Q,
     installed_paths: &mut Vec<PathBuf>,
-    tx: &mut SqlTransaction,
+    tx: &mut impl SqlRead,
 ) -> Result<(), CatError>
 where
     P: AsRef<Path>,
@@ -90,7 +91,7 @@ where
             let relative_path = entry
                 .path()
                 .strip_prefix(&from)
-                .map_err(|e| io::Error::other(e))?;
+                .map_err(io::Error::other)?;
             let dst = to.as_ref().join(relative_path);
             if tx.is_path_exist(&dst).await? {
                 return Err(CatError::Pac(format!(
@@ -130,7 +131,7 @@ where
                             std::os::unix::fs::symlink(&target, &dst)?;
                         }
                         io::ErrorKind::PermissionDenied => {
-                            add_permit(&dst.parent().unwrap(), 0o200)?;
+                            add_permit(dst.parent().unwrap(), 0o200)?;
                             std::os::unix::fs::symlink(&target, &dst)?;
                         }
                         _ => return Err(e.into()),
@@ -302,11 +303,12 @@ pub fn remove_dir_recursively_force<P: AsRef<Path>>(path: P) -> Result<(), io::E
 }
 
 // TODO: decrease code duplicate
+/// database read-only, based on current transaction
 pub async fn cp_dir_patch<P, Q>(
     src: P,
     dst: Q,
     installed_paths: &mut Vec<PathBuf>,
-    tx: &mut SqlTransaction,
+    tx: &mut impl SqlRead,
 ) -> Result<(), CatError>
 where
     P: AsRef<Path>,
@@ -314,11 +316,7 @@ where
 {
     let walk = WalkDir::new(&src).into_iter().filter_entry(|e| {
         // only install dirs at the top level
-        if e.depth() == 1 && !e.file_type().is_dir() {
-            false
-        } else {
-            true
-        }
+        !(e.depth() == 1 && !e.file_type().is_dir())
     });
     if let Err(e) = fs::create_dir_all(&dst)
         && e.kind() == io::ErrorKind::PermissionDenied
@@ -332,7 +330,7 @@ where
         let relative_path = entry
             .path()
             .strip_prefix(&src)
-            .map_err(|e| io::Error::other(e))?;
+            .map_err(io::Error::other)?;
         let dst = dst.as_ref().join(relative_path);
         if tx.is_path_exist(&dst).await? {
             return Err(CatError::Pac(format!(
@@ -372,7 +370,7 @@ where
                         std::os::unix::fs::symlink(&target, &dst)?;
                     }
                     io::ErrorKind::PermissionDenied => {
-                        add_permit(&dst.parent().unwrap(), 0o200)?;
+                        add_permit(dst.parent().unwrap(), 0o200)?;
                         std::os::unix::fs::symlink(&target, &dst)?;
                     }
                     _ => return Err(e.into()),
@@ -391,11 +389,12 @@ where
 
 // FIXME: the logic of handling error of permission denied is weird,
 // needs to be improved
+/// database read-only, based on current transaction
 pub async fn cp_dir_with_record_and_check<P, Q>(
     src: P,
     dst: Q,
     installed_paths: &mut Vec<PathBuf>,
-    tx: &mut SqlTransaction,
+    tx: &mut impl SqlRead,
 ) -> Result<Vec<(PathBuf, PathBuf)>, CatError>
 where
     P: AsRef<Path>,
@@ -403,14 +402,8 @@ where
 {
     let walk = WalkDir::new(&src).into_iter().filter_entry(|e| {
         // only install specific dirs at the top level
-        if e.depth() == 1
-            && (!DIR_TO_INSTALL.contains(e.file_name().to_string_lossy().as_ref())
-                || !e.file_type().is_dir())
-        {
-            false
-        } else {
-            true
-        }
+        !(e.depth() == 1 && (!DIR_TO_INSTALL.contains(e.file_name().to_string_lossy().as_ref())
+                || !e.file_type().is_dir()))
     });
     let mut symlinks = Vec::new();
     if let Err(e) = fs::create_dir_all(&dst)
@@ -425,11 +418,11 @@ where
         let mut relative_path = entry
             .path()
             .strip_prefix(&src)
-            .map_err(|e| io::Error::other(e))?;
+            .map_err(io::Error::other)?;
         if relative_path.starts_with(".bottle") {
             relative_path = relative_path
                 .strip_prefix(".bottle")
-                .map_err(|e| io::Error::other(e))?;
+                .map_err(io::Error::other)?;
         }
         let dst = dst.as_ref().join(relative_path);
         if tx.is_path_exist(&dst).await? {
@@ -470,7 +463,7 @@ where
                         std::os::unix::fs::symlink(&target, &dst)?;
                     }
                     io::ErrorKind::PermissionDenied => {
-                        add_permit(&dst.parent().unwrap(), 0o200)?;
+                        add_permit(dst.parent().unwrap(), 0o200)?;
                         std::os::unix::fs::symlink(&target, &dst)?;
                     }
                     _ => return Err(e.into()),
@@ -521,13 +514,7 @@ where
 {
     let walk = WalkDir::new(&src).into_iter().filter_entry(|e| {
         // ignore files and hidden folders at the top level
-        if e.depth() == 1
-            && (e.file_name().to_string_lossy().starts_with(".") || !e.file_type().is_dir())
-        {
-            false
-        } else {
-            true
-        }
+        !(e.depth() == 1 && (e.file_name().to_string_lossy().starts_with(".") || !e.file_type().is_dir()))
     });
     // FIXME: fix this weird operation, it do not handle error
     // when the error kind is not PermissionDenied
@@ -543,7 +530,7 @@ where
         let relative_path = entry
             .path()
             .strip_prefix(&src)
-            .map_err(|e| io::Error::other(e))?;
+            .map_err(io::Error::other)?;
         if RECORD_PATHS && !entry.file_type().is_dir() {
             installed_paths.push(relative_path.to_path_buf());
         }

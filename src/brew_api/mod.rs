@@ -1,6 +1,9 @@
 use crate::{
     API_MIRROR, BOTTLES_MIRROR, CACHE_DIR, CLIENT_WITH_RETRY, PAC_PATH,
-    database::local::{PacState, SqlTransaction},
+    database::{
+        basic::{SqlPool, SqlRead},
+        local::{PacState, SqlTransMark},
+    },
     errors::{CatError, CloudError, RequestError},
     macos::{
         file::{CmpPath, remove_dir_force, remove_dir_recursively_force, remove_file_force},
@@ -21,7 +24,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    hash::Hasher,
     io::{BufReader, Read, Write},
     iter::zip,
     path::{Path, PathBuf},
@@ -29,7 +31,6 @@ use std::{
     sync::LazyLock,
 };
 use strum::EnumString;
-use tokio::io::AsyncWriteExt;
 
 static PROGRESS_STYLE: LazyLock<ProgressStyle> = LazyLock::new(|| {
     ProgressStyle::default_bar()
@@ -152,34 +153,6 @@ async fn get_token(repo: &str, name: &str) -> Result<String, CloudError> {
     Ok(json.token)
 }
 
-async fn download(repo: &str, url: &str, name: &str, sha256: &str) -> Result<PathBuf, CatError> {
-    let token = get_token(repo, name).await?;
-    let mut response = CLIENT_WITH_RETRY.get(url).bearer_auth(token).send().await?;
-    let content_length = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|l| l.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or(CloudError::api("Can not download"))?;
-    let mut path = CACHE_DIR.clone();
-    path.push(format!("{name}.tar.gz"));
-    let mut file = fs::File::create(&path)?;
-    let progress = ProgressBar::new(content_length);
-    progress.set_style(PROGRESS_STYLE.clone());
-    while let Some(bytes) = response.chunk().await? {
-        file.write_all(&bytes)?;
-        progress.inc(bytes.len() as u64);
-    }
-    if verify_hash(&path, sha256, Sha256::new())? {
-        Ok(path)
-    } else {
-        Err(CatError::Hash(format!(
-            "Hash mismatch for downloaded file: {:?}",
-            path
-        )))
-    }
-}
-
 async fn download_with_bar(
     repo: &str,
     url: &str,
@@ -245,14 +218,15 @@ async fn download_with_bar(
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or(CloudError::api("Can not download"))?;
 
-    let mut file = tokio::fs::File::create(&path).await?;
+    let mut file = std::fs::File::create(&path)?;
     progress.set_length(content_length);
     progress.set_prefix(name.to_string());
     let progress = progress.with_finish(indicatif::ProgressFinish::Abandon);
     while let Some(bytes) = response.chunk().await? {
-        file.write_all(&bytes).await?;
+        file.write_all(&bytes)?;
         progress.inc(bytes.len() as u64);
     }
+    file.sync_all()?;
     if verify_hash(&path, sha256, Sha256::new())? {
         Ok(path)
     } else {
@@ -263,10 +237,14 @@ async fn download_with_bar(
     }
 }
 
-pub async fn download_multi(pacs: &Vec<Rc<PacInfo>>) -> Result<Vec<PathBuf>, CatError> {
+pub async fn download_multi<P>(pacs: &[P]) -> Result<Vec<PathBuf>, CatError>
+where
+    P: AsRef<PacInfo>,
+{
     let multi_bar = MultiProgress::new();
     let mut futs = Vec::new();
     for pac in pacs.iter() {
+        let pac = pac.as_ref();
         if let Some(bottle) = &pac.bottle
             && let Some(bottle) = &bottle.stable
         {
@@ -284,7 +262,7 @@ pub async fn download_multi(pacs: &Vec<Rc<PacInfo>>) -> Result<Vec<PathBuf>, Cat
             let bar = ProgressBar::hidden();
             bar.set_style(PROGRESS_STYLE.clone());
             let bar = multi_bar.add(bar);
-            let fut = download_with_bar(&pac.tap, &file.url, &pac.name, &file.sha256, &pac, bar);
+            let fut = download_with_bar(&pac.tap, &file.url, &pac.name, &file.sha256, pac, bar);
             futs.push(fut);
         } else {
             return Err(CatError::Pac(format!(
@@ -340,9 +318,10 @@ where
     Ok(result_array == expected_hash)
 }
 
-pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
-    let mut tx = SqlTransaction::new().await?;
-    if let Some((_, state)) = tx.is_installed(req_name).await? {
+/// database **write**
+pub async fn install_pac(req_name: &str, mark: SqlTransMark) -> Result<(), CatError> {
+    let mut pool = SqlPool;
+    if let Some((_, state)) = pool.is_installed(req_name).await? {
         match state {
             PacState::Installed => {
                 println!("Package {} is already installed", req_name);
@@ -363,7 +342,7 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
     deps.push(Rc::new(pac));
     let mut to_install = Vec::new();
     for dep in deps {
-        match tx.is_installed(&dep.name).await? {
+        match pool.is_installed(&dep.name).await? {
             Some((_, state)) => {
                 if let PacState::Broken = state {
                     return Err(CatError::Pac(format!(
@@ -377,7 +356,7 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
         }
     }
     println!("detecting conflicts...");
-    detect_conflicts(&to_install, &mut tx).await?;
+    detect_conflicts(&to_install, &mut pool).await?;
     println!("downloading pacs...");
     let paths = download_multi(&to_install).await?;
     let mut temp_paths = DropGuard::new(Vec::<PathBuf>::new(), |temp_paths| {
@@ -409,7 +388,7 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
                 {
                     dirs.insert(CmpPath(parent));
                 }
-                if let Err(e) = remove_file_force(&p) {
+                if let Err(e) = remove_file_force(p) {
                     eprintln!(
                         "Warning: Can not remove installed file: {}, error: {e}",
                         p.display()
@@ -428,6 +407,8 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
         println!("recovery finished!");
     });
     // install pacs
+    drop(pool);
+    let mut tx = mark.into_transaction().await?;
     for (pac, mut path) in zip(to_install, paths) {
         println!("installing {}", pac.full_name);
         println!("loading downloaded files");
@@ -440,7 +421,11 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
         let _ = remove_dir_recursively_force(&temp_dir);
         temp_paths.push(temp_dir.clone());
         println!("extracting...");
-        archive.unpack(&temp_dir)?;
+        let temp_dir_clone = temp_dir.clone();
+        tokio::task::spawn_blocking(move || archive.unpack(&temp_dir_clone))
+            .await
+            .unwrap()?;
+
         let name_version = if pac.revision > 0 {
             format!(
                 "{}/{}_{}",
@@ -473,14 +458,15 @@ pub async fn install_pac(req_name: &str) -> Result<(), CatError> {
             &pac,
             crate::database::local::PacSource::Brew,
             pac.versions.stable.as_ref().unwrap(),
-            &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
+            pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
             sha256,
             pac.name == req_name,
-            &installed_files,
+            installed_files,
         )
         .await?;
         println!("Package {} is installed now", pac.full_name);
     }
+
     tx.commit().await?;
     // IMPORTANT: cancel the drop guard
     restore_guard.into_inner();

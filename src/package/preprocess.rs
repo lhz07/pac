@@ -83,7 +83,7 @@ where
                 CodeSignatureFlags::ADHOC | CodeSignatureFlags::ENFORCEMENT,
             );
             let sign = apple_codesign::UnifiedSigner::new(settings);
-            if let Err(e) = sign.sign_macho(&path, &path) {
+            if let Err(e) = sign.sign_macho(path, path) {
                 eprintln!(
                     "Warning: can not sign binary {}, error: {e}\n\
                     You may need to sign it manually with `codesign --sign - --force <path>`",
@@ -101,7 +101,7 @@ where
             };
             let content = replace_str(&content, prefix_with_version, PAC_PATH);
             add_permit(path, 0o200)?;
-            fs::write(&path, content)?;
+            fs::write(path, content)?;
         }
     }
     Ok(())

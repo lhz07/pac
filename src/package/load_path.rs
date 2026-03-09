@@ -18,15 +18,15 @@ fn handle_single_binary(mach: MachO) -> Result<Vec<String>, io::Error> {
 }
 
 fn list_lib_path(binary: &[u8]) -> Result<Vec<String>, io::Error> {
-    match Mach::parse(&binary).map_err(|e| io::Error::other(e))? {
+    match Mach::parse(binary).map_err(io::Error::other)? {
         goblin::mach::Mach::Binary(bin) => return handle_single_binary(bin),
         goblin::mach::Mach::Fat(bin) => {
-            for arch in bin.arches().map_err(|e| io::Error::other(e))? {
+            for arch in bin.arches().map_err(io::Error::other)? {
                 if describe_arch(arch.cputype) == ARCH {
                     let start = arch.offset as usize;
                     let end = start + arch.size as usize;
                     let binary = &binary[start..end];
-                    let o = Mach::parse(binary).map_err(|e| io::Error::other(e))?;
+                    let o = Mach::parse(binary).map_err(io::Error::other)?;
                     if let goblin::mach::Mach::Binary(bin) = o {
                         return handle_single_binary(bin);
                     } else {

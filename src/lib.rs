@@ -1,7 +1,9 @@
-use std::{path::PathBuf, sync::LazyLock, time::Duration};
+#![allow(clippy::drop_non_drop)]
+#![allow(clippy::too_many_arguments)]
 
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use std::{path::PathBuf, sync::LazyLock, time::Duration};
 
 pub mod brew_api;
 pub mod cli;
@@ -14,7 +16,7 @@ pub mod scopeguard;
 pub mod sql;
 
 pub const PAC_PATH: &str = "/opt/pac";
-pub const CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+pub static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     let mut dir = match dirs::cache_dir() {
         Some(d) => d,
         None => {

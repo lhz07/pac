@@ -9,9 +9,11 @@ pub const INSERT_INSTALLED_FILE: &str = include_str!("insert_installed_file.sql"
 pub const SELECT_PAC_NAME: &str = include_str!("select_pac_name.sql");
 pub const SELECT_PAC_NAMES: &str = include_str!("select_pac_names.sql");
 pub const SELECT_PACS: &str = include_str!("select_pacs.sql");
+pub const SELECT_PACS_BY_SOURCE: &str = include_str!("select_pacs_by_source.sql");
 pub const SELECT_PAC_ID: &str = include_str!("select_pac_id.sql");
 pub const SELECT_EXIST_FILE: &str = include_str!("select_exist_file.sql");
 pub const SELECT_INSTALLED_FILE: &str = include_str!("select_installed_file.sql");
+pub const SELECT_ALL_INSTALLED_FILE: &str = include_str!("select_all_installed_file.sql");
 pub const SELECT_REVERSE_DEP: &str = include_str!("select_reverse_dep.sql");
 pub const SELECT_ORPHAN_PAC: &str = include_str!("select_orphan_pac.sql");
 

@@ -4,9 +4,10 @@ use std::{
     rc::Rc,
 };
 
+
 use crate::{
     brew_api::{PacInfo, get_json_api, get_json_api_multi},
-    database::local::SqlTransaction,
+    database::basic::SqlRead,
     errors::CatError,
     package::script::Pac,
 };
@@ -135,7 +136,8 @@ impl PacInfoRef for &Pac {
     }
 }
 
-pub async fn detect_conflicts<P>(pacs: &[P], tx: &mut SqlTransaction) -> Result<(), CatError>
+/// database read-only
+pub async fn detect_conflicts<P>(pacs: &[P], conn: &mut impl SqlRead) -> Result<(), CatError>
 where
     P: PacInfoRef,
 {
@@ -149,7 +151,7 @@ where
                     conflict_pac
                 )));
             }
-            if tx.is_installed(conflict_pac).await?.is_some() {
+            if conn.is_installed(conflict_pac).await?.is_some() {
                 return Err(CatError::Pac(format!(
                     "pac `{}` conflicts with installed pac `{}`",
                     pac.name(),

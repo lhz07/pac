@@ -2,7 +2,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "pac", version = "0.1.0", about = "A fast package manager")]
-pub struct Cli {
+pub struct CliArgs {
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -13,6 +13,7 @@ pub enum Commands {
     #[command(group(
         ArgGroup::new("install_source")
             .required(true)
+            .multiple(false)
             .args(&["names", "dir"])
     ))]
     Install(InstallArgs),
@@ -24,8 +25,12 @@ pub enum Commands {
         name: String,
     },
 
+    Clean(CleanArgs),
+
     /// List installed packages
     List,
+
+    Update,
 
     /// List leave packages
     Leaves,
@@ -47,4 +52,25 @@ pub struct InstallArgs {
     /// Install from local directory
     #[arg(short = 'd', long = "dir", help = "Install from local directory")]
     pub dir: Option<String>,
+}
+
+#[derive(Parser)]
+#[command(
+    group(
+        ArgGroup::new("clean_mode")
+            .args(["cache", "untracked"])
+            .required(true)
+            .multiple(false)
+    )
+)]
+pub struct CleanArgs {
+    #[arg(short = 'c', long = "cache", help = "Clean package cache")]
+    pub cache: bool,
+
+    #[arg(
+        short = 'u',
+        long = "untracked",
+        help = "Clean all untracked files in pac path"
+    )]
+    pub untracked: bool,
 }

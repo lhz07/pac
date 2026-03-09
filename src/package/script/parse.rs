@@ -2,7 +2,10 @@ use crate::{
     CACHE_DIR, CLIENT_WITH_RETRY, PAC_PATH,
     brew_api::{download_multi, verify_hash},
     compress::decompress_file,
-    database::local::{PacState, SqlTransaction},
+    database::{
+        basic::{SqlPool, SqlRead},
+        local::{PacState, SqlTransMark},
+    },
     errors::{CatError, CloudError, RequestError},
     macos::{
         file::{
@@ -12,7 +15,7 @@ use crate::{
     },
     package::{
         after_install::set_proper_permissions,
-        find_depend::{PacInfoRef, detect_conflicts, resolve_depend},
+        find_depend::{detect_conflicts, resolve_depend},
         install::install,
         preprocess::before_install,
         script::{Basic, Pac, PacFile, task::handle_task},
@@ -25,12 +28,11 @@ use sha2::Digest;
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    io::BufReader,
+    io::{BufReader, Write},
     iter::zip,
     path::{Path, PathBuf},
 };
 use strfmt::strfmt;
-use tokio::io::AsyncWriteExt;
 
 pub async fn parse_script<P>(content: String, dir_prefix: P) -> Result<Pac, CatError>
 where
@@ -40,7 +42,7 @@ where
         .map_err(|e| CatError::Pac(format!("Can not parse pac toml, error: {e}")))?;
     let mut variable_map = HashMap::new();
     for task in pac.task.iter() {
-        handle_task(&task, &mut variable_map, dir_prefix.as_ref()).await?;
+        handle_task(task, &mut variable_map, dir_prefix.as_ref()).await?;
     }
     for file in pac.file.iter_mut() {
         let url = strfmt(&file.url, &variable_map)
@@ -65,14 +67,15 @@ where
     Ok(pac)
 }
 
-pub async fn install_pac_from_file<P>(path: P) -> Result<(), CatError>
+/// database **write**
+pub async fn install_pac_from_file<P>(path: P, mark: SqlTransMark) -> Result<(), CatError>
 where
     P: AsRef<Path>,
 {
+    let mut pool = SqlPool;
     let content = fs::read_to_string(path.as_ref().join("pac.toml"))?;
     let pac = parse_script(content, path.as_ref()).await?;
-    let mut tx = SqlTransaction::new().await?;
-    if let Some((_, state)) = tx.is_installed(&pac.basic.name).await? {
+    if let Some((_, state)) = pool.is_installed(&pac.basic.name).await? {
         match state {
             PacState::Installed => {
                 println!("Package {} is already installed", &pac.basic.name);
@@ -87,11 +90,11 @@ where
         }
     }
     // TODO: support pac deps, only handle brew deps for now
-    let brew_deps = parse_deps(&pac.basic.brew_dependencies, &pac.basic.name, &mut tx).await?;
+    let brew_deps = parse_deps(&pac.basic.brew_dependencies, &pac.basic.name, &mut pool).await?;
     let deps = resolve_depend(&pac.basic.name, &brew_deps).await?;
     let mut to_install = Vec::new();
     for dep in deps {
-        match tx.is_installed(&dep.name).await? {
+        match pool.is_installed(&dep.name).await? {
             Some((_, state)) => {
                 if let PacState::Broken = state {
                     return Err(CatError::Pac(format!(
@@ -105,9 +108,9 @@ where
         }
     }
     println!("detecting conflicts...");
-    detect_conflicts(&to_install, &mut tx).await?;
+    detect_conflicts(&to_install, &mut pool).await?;
     let p = [&pac];
-    detect_conflicts(&p, &mut tx).await?;
+    detect_conflicts(&p, &mut pool).await?;
     println!("downloading pacs...");
     let paths = download_multi(&to_install).await?;
     let mut temp_paths = DropGuard::new(Vec::<PathBuf>::new(), |temp_paths| {
@@ -139,7 +142,7 @@ where
                 {
                     dirs.insert(CmpPath(parent));
                 }
-                if let Err(e) = remove_file_force(&p)
+                if let Err(e) = remove_file_force(p)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
                     eprintln!(
@@ -163,6 +166,8 @@ where
         println!("recovery finished!");
     });
     // install pacs
+    drop(pool);
+    let mut tx = mark.into_transaction().await?;
     for (pac, mut path) in zip(to_install, paths) {
         println!("installing {}", pac.full_name);
         println!("loading downloaded files");
@@ -208,10 +213,10 @@ where
             &pac,
             crate::database::local::PacSource::Brew,
             pac.versions.stable.as_ref().unwrap(),
-            &pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
+            pac.bottle.as_ref().unwrap().stable.as_ref().unwrap(),
             sha256,
             false,
-            &installed_files,
+            installed_files,
         )
         .await?;
         println!("Package {} is installed now", pac.full_name);
@@ -227,7 +232,7 @@ where
         let to =
             CACHE_DIR.join(file_path.file_name().unwrap().to_string_lossy().to_string() + ".d");
         let _file_guard = DropGuard::new(&to, |path| {
-            if let Err(e) = remove_dir_recursively_force(&path) {
+            if let Err(e) = remove_dir_recursively_force(path) {
                 eprintln!(
                     "Warning: Can not clean temp path: {}, error: {e}",
                     path.display()
@@ -257,19 +262,19 @@ where
     // IMPORTANT: cancel the drop guard
     restore_guard.into_inner();
     let bin = target_root_path.join("bin");
-    if bin.exists() {
-        if let Err(e) = set_proper_permissions(bin, 0o755) {
-            eprintln!("Warning: Can not set proper permissions for bin dir: {}", e);
-        }
+    if bin.exists()
+        && let Err(e) = set_proper_permissions(bin, 0o755)
+    {
+        eprintln!("Warning: Can not set proper permissions for bin dir: {}", e);
     }
     let sbin = target_root_path.join("sbin");
-    if sbin.exists() {
-        if let Err(e) = set_proper_permissions(sbin, 0o755) {
-            eprintln!(
-                "Warning: Can not set proper permissions for sbin dir: {}",
-                e
-            );
-        }
+    if sbin.exists()
+        && let Err(e) = set_proper_permissions(sbin, 0o755)
+    {
+        eprintln!(
+            "Warning: Can not set proper permissions for sbin dir: {}",
+            e
+        );
     }
     Ok(())
 }
@@ -318,14 +323,15 @@ pub async fn download_file(pac_basic: &Basic, pac_file: &PacFile) -> Result<Path
         .and_then(|l| l.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or(CloudError::api("Can not download"))?;
-    let mut file = tokio::fs::File::create(&path).await?;
+    let mut file = std::fs::File::create(&path)?;
     let progress = indicatif::ProgressBar::new(content_length);
     progress.set_prefix(pac_basic.name.to_string());
     // let progress = progress.with_finish(indicatif::ProgressFinish::Abandon);
     while let Some(bytes) = response.chunk().await? {
-        file.write_all(&bytes).await?;
+        file.write_all(&bytes)?;
         progress.inc(bytes.len() as u64);
     }
+    file.sync_all()?;
     if let Some(checksum) = &pac_file.checksum {
         match &checksum.method {
             crate::brew_api::HashMethod::Sha256 => {
@@ -353,10 +359,11 @@ pub async fn download_file(pac_basic: &Basic, pac_file: &PacFile) -> Result<Path
     Ok(path)
 }
 
+/// database read-only
 pub async fn parse_deps(
     deps: &Vec<String>,
     pac_name: &str,
-    tx: &mut SqlTransaction,
+    pool: &mut impl SqlRead,
 ) -> Result<Vec<String>, CatError> {
     const SEP: &str = " | ";
     let mut dependency = Vec::new();
@@ -364,32 +371,30 @@ pub async fn parse_deps(
         if dep.contains(SEP) {
             let mut list = Vec::new();
             for (i, d) in dep.split(SEP).enumerate() {
-                if tx.is_installed(d).await?.is_some() {
+                if pool.is_installed(d).await?.is_some() {
                     continue;
                 }
                 println!("{i}. {d}");
                 list.push(d);
             }
             let mut input = String::new();
-            let mut index = 0;
             println!(
                 "{} depends on a selectable dependency, please select one of them: (default: 0)",
                 pac_name
             );
-            loop {
+            let index = loop {
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim().is_empty() {
-                    break;
+                    break 0;
                 } else if let Ok(i) = input.trim().parse::<usize>()
                     && (0..list.len()).contains(&i)
                 {
-                    index = i;
-                    break;
+                    break i;
                 } else {
                     println!("Please enter a valid index");
                     input.clear();
                 }
-            }
+            };
             dependency.push(list[index].to_string());
         } else {
             dependency.push(dep.to_string());

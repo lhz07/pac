@@ -1,10 +1,10 @@
 use terminal_size::{Width, terminal_size};
 
-use crate::{database::local::SqlTransaction, errors::CatError};
+use crate::{database::basic::SqlRead, errors::CatError};
 
-pub async fn list_pacs() -> Result<(), CatError> {
-    let mut tx = SqlTransaction::new().await?;
-    let pacs = tx.get_pac_names().await?;
+/// database read-only
+pub async fn list_pacs(conn: &mut impl SqlRead) -> Result<(), CatError> {
+    let pacs = conn.get_pac_names().await?;
     if pacs.is_empty() {
         println!("No packages installed.");
     } else {
@@ -14,9 +14,9 @@ pub async fn list_pacs() -> Result<(), CatError> {
     Ok(())
 }
 
-pub async fn list_leaves() -> Result<(), CatError> {
-    let mut tx = SqlTransaction::new().await?;
-    let pacs = tx.get_pacs(true).await?;
+/// database read-only
+pub async fn list_leaves(conn: &mut impl SqlRead) -> Result<(), CatError> {
+    let pacs = conn.get_pacs(true).await?;
     if pacs.is_empty() {
         println!("No packages installed.");
     } else {
@@ -26,7 +26,10 @@ pub async fn list_leaves() -> Result<(), CatError> {
     Ok(())
 }
 
-fn print_columns_vertical(items: &[String]) {
+pub fn print_columns_vertical<S>(items: &[S])
+where
+    S: AsRef<str>,
+{
     if items.is_empty() {
         return;
     }
@@ -43,13 +46,13 @@ fn print_columns_vertical(items: &[String]) {
     let mut best_widths = vec![0];
 
     for cols in (1..=n).rev() {
-        let rows = (n + cols - 1) / cols;
+        let rows = n.div_ceil(cols);
         let mut widths = vec![0; cols];
 
         for col in 0..cols {
             for row in 0..rows {
                 if let Some(item) = items.get(row + col * rows) {
-                    widths[col] = widths[col].max(item.len());
+                    widths[col] = widths[col].max(item.as_ref().len());
                 }
             }
         }
@@ -63,16 +66,16 @@ fn print_columns_vertical(items: &[String]) {
     }
 
     let cols = best_cols;
-    let rows = (n + cols - 1) / cols;
+    let rows = n.div_ceil(cols);
 
     // Output items top-to-bottom, left-to-right
     for row in 0..rows {
         for col in 0..cols {
             if let Some(item) = items.get(row + col * rows) {
                 if col == cols - 1 {
-                    print!("{item}");
+                    print!("{}", item.as_ref());
                 } else {
-                    print!("{:<width$}", item, width = best_widths[col] + 4);
+                    print!("{:<width$}", item.as_ref(), width = best_widths[col] + 4);
                 }
             }
         }

@@ -1,18 +1,17 @@
+use crate::{
+    PAC_PATH,
+    database::basic::SqlRead,
+    errors::CatError,
+    macos::file::{
+        add_permit, copy_file_force, cp_dir_patch, cp_dir_with_record_and_check, remove_file_force,
+    },
+};
 use std::{
     collections::HashSet,
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
     sync::LazyLock,
-};
-
-use crate::{
-    PAC_PATH,
-    database::local::SqlTransaction,
-    errors::CatError,
-    macos::file::{
-        add_permit, copy_file_force, cp_dir_patch, cp_dir_with_record_and_check, remove_file_force,
-    },
 };
 
 pub static DIR_TO_INSTALL: LazyLock<HashSet<&str>> = LazyLock::new(|| {
@@ -30,10 +29,11 @@ pub static DIR_TO_INSTALL: LazyLock<HashSet<&str>> = LazyLock::new(|| {
     set
 });
 
+/// database read-only
 pub async fn install<P>(
     path: P,
     installed_paths: &mut Vec<PathBuf>,
-    tx: &mut SqlTransaction,
+    tx: &mut impl SqlRead,
 ) -> Result<(), CatError>
 where
     P: AsRef<Path>,
@@ -87,7 +87,7 @@ where
                         std::os::unix::fs::symlink(TARGET, &dst)?;
                     }
                     io::ErrorKind::PermissionDenied => {
-                        add_permit(&dst.parent().unwrap(), 0o200)?;
+                        add_permit(dst.parent().unwrap(), 0o200)?;
                         std::os::unix::fs::symlink(TARGET, &dst)?;
                     }
                     _ => return Err(e.into()),

@@ -1,0 +1,2 @@
+SELECT installed_files.path
+FROM installed_files

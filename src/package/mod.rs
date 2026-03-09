@@ -1,4 +1,5 @@
 pub mod after_install;
+pub mod clean;
 pub mod find_depend;
 pub mod install;
 pub mod list;
@@ -8,3 +9,4 @@ pub mod relocate;
 pub mod sandbox;
 pub mod script;
 pub mod uninstall;
+pub mod update;
